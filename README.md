@@ -160,6 +160,8 @@ func bounded(client: SshClient) -> Result {
         requestContext,
         "long-running-command",
     )
+    print(requestContext.expiresIn("milliseconds"))
+    print(requestContext.expired())
     requestContext.cancel("request complete")
     return result
 }
