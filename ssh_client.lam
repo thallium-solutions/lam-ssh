@@ -1,0 +1,805 @@
+# Stateful SSH client, reusable session template, command results, and typed
+# direct-TCP escape hatch.
+
+from lamerrors import Result, Error
+from lamos import Os
+from .ssh_config import SshConfig, sshValidEnvironmentName
+from .ssh_context import Context, SshContext
+from .ssh_key import SshKey, SshKeyPair
+
+go! {
+    import (
+        "bytes"
+        "context"
+        "crypto/subtle"
+        "errors"
+        "fmt"
+        "io"
+        "net"
+        "os"
+        "path/filepath"
+        "sort"
+        "strings"
+        "sync"
+        "time"
+
+        gossh "golang.org/x/crypto/ssh"
+        "golang.org/x/crypto/ssh/knownhosts"
+    )
+
+    type lamSshClientState struct {
+        Mu     sync.RWMutex
+        Client *gossh.Client
+        Closed bool
+    }
+
+    type lamSshSessionState struct {
+        Mu     sync.RWMutex
+        Client *lamSshClientState
+        Closed bool
+    }
+
+    type lamSshTcpConnState struct {
+        Mu     sync.RWMutex
+        Conn   net.Conn
+        Closed bool
+    }
+
+    type lamSshSessionStart struct {
+        Kind    string
+        Message string
+        Err     error
+    }
+
+    func lamSshClientResultError(kind, message string) *Result {
+        return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(kind, message, nil))
+    }
+
+    func lamSshNativeContext(value *Context) (context.Context, error) {
+        if value == nil {
+            return nil, errors.New("context must not be nil")
+        }
+        native := value.Native()
+        nativeContext, ok := native.(context.Context)
+        if !ok || nativeContext == nil {
+            return nil, errors.New("Context.native() did not return context.Context")
+        }
+        return nativeContext, nil
+    }
+
+    func lamSshClientFromState(state *lamSshClientState) (*gossh.Client, error) {
+        if state == nil {
+            return nil, errors.New("SSH client is not initialized")
+        }
+        state.Mu.RLock()
+        defer state.Mu.RUnlock()
+        if state.Closed || state.Client == nil {
+            return nil, errors.New("SSH client is closed")
+        }
+        return state.Client, nil
+    }
+
+    func lamSshExpandHome(path string) string {
+        if path == "~" || strings.HasPrefix(path, "~/") {
+            if home, err := os.UserHomeDir(); err == nil {
+                if path == "~" {
+                    return home
+                }
+                return filepath.Join(home, path[2:])
+            }
+        }
+        return path
+    }
+
+    func lamSshHostKeyCallback(config *SshConfig) (gossh.HostKeyCallback, error) {
+        if config.InsecureIgnoreHostKey {
+            return gossh.InsecureIgnoreHostKey(), nil
+        }
+
+        callbacks := make([]gossh.HostKeyCallback, 0, 2)
+        if len(config.KnownHostsFiles) > 0 {
+            paths := make([]string, 0, len(config.KnownHostsFiles))
+            for _, path := range config.KnownHostsFiles {
+                paths = append(paths, lamSshExpandHome(path))
+            }
+            callback, err := knownhosts.New(paths...)
+            if err != nil {
+                return nil, fmt.Errorf("load known_hosts: %w", err)
+            }
+            callbacks = append(callbacks, callback)
+        }
+
+        if config.HostKeyFingerprint != "" {
+            expected := strings.TrimSpace(config.HostKeyFingerprint)
+            callbacks = append(callbacks, func(hostname string, remote net.Addr, key gossh.PublicKey) error {
+                actual := gossh.FingerprintSHA256(key)
+                if subtle.ConstantTimeCompare([]byte(actual), []byte(expected)) != 1 {
+                    return fmt.Errorf("host-key fingerprint mismatch for %s: got %s", hostname, actual)
+                }
+                return nil
+            })
+        }
+
+        if len(callbacks) == 0 {
+            return nil, errors.New("host-key verification is not configured")
+        }
+        return func(hostname string, remote net.Addr, key gossh.PublicKey) error {
+            for _, callback := range callbacks {
+                if err := callback(hostname, remote, key); err != nil {
+                    return err
+                }
+            }
+            return nil
+        }, nil
+    }
+
+    func lamSshAuthMethods(config *SshConfig, privateKeyMaterial string) ([]gossh.AuthMethod, error) {
+        methods := make([]gossh.AuthMethod, 0, 2)
+        if config.Password != "" {
+            methods = append(methods, gossh.Password(config.Password))
+        }
+        if privateKeyMaterial != "" {
+            signer, err := lamSshParsePrivateKey(privateKeyMaterial, config.PrivateKeyPassphrase)
+            if err != nil {
+                return nil, fmt.Errorf("parse SSH private key: %w", err)
+            }
+            methods = append(methods, gossh.PublicKeys(signer))
+        }
+        if len(methods) == 0 {
+            return nil, errors.New("no SSH authentication method is configured")
+        }
+        return methods, nil
+    }
+
+    func lamSshTryConnect(config *SshConfig, privateKeyMaterial string) *Result {
+        auth, err := lamSshAuthMethods(config, privateKeyMaterial)
+        if err != nil {
+            return lamSshClientResultError("SshAuthenticationConfigError", err.Error())
+        }
+        hostKeyCallback, err := lamSshHostKeyCallback(config)
+        if err != nil {
+            return lamSshClientResultError("SshHostKeyConfigError", err.Error())
+        }
+
+        address := net.JoinHostPort(config.Host, fmt.Sprintf("%d", config.Port))
+        dialer := &net.Dialer{Timeout: time.Duration(config.ConnectTimeoutMs) * time.Millisecond}
+        tcpConn, err := dialer.DialContext(context.Background(), "tcp", address)
+        if err != nil {
+            return lamSshClientResultError("SshConnectError", "could not connect to "+address+": "+err.Error())
+        }
+
+        deadline := time.Now().Add(time.Duration(config.HandshakeTimeoutMs) * time.Millisecond)
+        if err := tcpConn.SetDeadline(deadline); err != nil {
+            tcpConn.Close()
+            return lamSshClientResultError("SshConnectError", "could not set SSH handshake deadline: "+err.Error())
+        }
+        clientConfig := &gossh.ClientConfig{
+            User:            config.Username,
+            Auth:            auth,
+            HostKeyCallback: hostKeyCallback,
+            Timeout:         time.Duration(config.ConnectTimeoutMs) * time.Millisecond,
+        }
+        clientConn, channels, requests, err := gossh.NewClientConn(tcpConn, address, clientConfig)
+        if err != nil {
+            tcpConn.Close()
+            return lamSshClientResultError("SshHandshakeError", "SSH handshake failed: "+err.Error())
+        }
+        if err := tcpConn.SetDeadline(time.Time{}); err != nil {
+            clientConn.Close()
+            return lamSshClientResultError("SshConnectError", "could not clear SSH handshake deadline: "+err.Error())
+        }
+
+        nativeClient := gossh.NewClient(clientConn, channels, requests)
+        state := &lamSshClientState{Client: nativeClient}
+        out := NewSshClient(config)
+        out.Raw = state
+
+        go func() {
+            _ = nativeClient.Wait()
+            state.Mu.Lock()
+            state.Closed = true
+            state.Client = nil
+            state.Mu.Unlock()
+        }()
+        return LAMMERGEIER.Result.Ok(out)
+    }
+
+    func lamSshExecute(ctx context.Context, clientState *lamSshClientState, command string, environment map[string]string, stdinData string) *Result {
+        if strings.TrimSpace(command) == "" {
+            return lamSshClientResultError("SshCommandError", "command must not be empty")
+        }
+        select {
+        case <-ctx.Done():
+            return lamSshClientResultError("SshContextCancelled", "SSH command cancelled before start: "+ctx.Err().Error())
+        default:
+        }
+
+        client, err := lamSshClientFromState(clientState)
+        if err != nil {
+            return lamSshClientResultError("SshClientClosed", err.Error())
+        }
+        nativeSession, err := client.NewSession()
+        if err != nil {
+            return lamSshClientResultError("SshSessionError", "could not open SSH session: "+err.Error())
+        }
+        defer nativeSession.Close()
+
+        var stdout bytes.Buffer
+        var stderr bytes.Buffer
+        nativeSession.Stdout = &stdout
+        nativeSession.Stderr = &stderr
+        if stdinData != "" {
+            nativeSession.Stdin = strings.NewReader(stdinData)
+        }
+
+        keys := make([]string, 0, len(environment))
+        for name := range environment {
+            keys = append(keys, name)
+        }
+        sort.Strings(keys)
+        startDone := make(chan lamSshSessionStart, 1)
+        go func() {
+            for _, name := range keys {
+                if startErr := nativeSession.Setenv(name, environment[name]); startErr != nil {
+                    startDone <- lamSshSessionStart{
+                        Kind:    "SshEnvironmentError",
+                        Message: "server rejected environment variable " + name,
+                        Err:     startErr,
+                    }
+                    return
+                }
+            }
+            startErr := nativeSession.Start(command)
+            startDone <- lamSshSessionStart{
+                Kind:    "SshCommandStartError",
+                Message: "could not start SSH command",
+                Err:     startErr,
+            }
+        }()
+
+        select {
+        case started := <-startDone:
+            if started.Err != nil {
+                return lamSshClientResultError(started.Kind, started.Message+": "+started.Err.Error())
+            }
+        case <-ctx.Done():
+            _ = nativeSession.Close()
+            <-startDone
+            return lamSshClientResultError("SshContextCancelled", "SSH command cancelled during setup: "+ctx.Err().Error())
+        }
+
+        waitDone := make(chan error, 1)
+        go func() { waitDone <- nativeSession.Wait() }()
+
+        select {
+        case err = <-waitDone:
+        case <-ctx.Done():
+            _ = nativeSession.Signal(gossh.SIGKILL)
+            _ = nativeSession.Close()
+            <-waitDone
+            return lamSshClientResultError("SshContextCancelled", "SSH command cancelled: "+ctx.Err().Error())
+        }
+
+        exitCode := 0
+        success := err == nil
+        if err != nil {
+            if exitError, ok := err.(*gossh.ExitError); ok {
+                exitCode = exitError.ExitStatus()
+            } else {
+                return lamSshClientResultError("SshCommandTransportError", "SSH command did not return an exit status: "+err.Error())
+            }
+        }
+        return LAMMERGEIER.Result.Ok(NewSshCommandResult(stdout.String(), stderr.String(), exitCode, success))
+    }
+}
+
+class SshCommandResult {
+    func __init__(self, stdout: str, stderr: str, exitCode: int, success: bool) {
+        self.stdout: str = stdout
+        self.stderr: str = stderr
+        self.exitCode: int = exitCode
+        self.success: bool = success
+    }
+}
+
+class SshClient {
+    func __init__(self, config: SshConfig) {
+        self.config: SshConfig = config
+        self.raw: any = None
+    }
+
+    static func tryConnect(config: SshConfig) -> Result[SshClient] {
+        validation: Result[SshConfig] = config.validate()
+        if not validation.ok() {
+            return Result.Err(validation.error)
+        }
+
+        privateKeyMaterial: str = config.privateKeyPem
+        if privateKeyMaterial == "" and config.privateKeyPath != "" {
+            loaded: Result[str] = Os.tryReadFile(config.privateKeyPath)
+            if not loaded.ok() {
+                return Result.Err(Error("SshKeyFileError", "could not read configured private-key file", loaded.error))
+            }
+            privateKeyMaterial = str(loaded.unwrap())
+        }
+        go! {
+            return lamSshTryConnect(config, privateKeyMaterial)
+        }
+    }
+
+    static func connect(config: SshConfig) -> SshClient {
+        result: Result[SshClient] = SshClient.tryConnect(config)
+        if not result.ok() {
+            throw RuntimeError(str(result.error))
+        }
+        go! {
+            client, ok := result.Value.(*SshClient)
+            if !ok {
+                panic("@lam/ssh internal error: connect returned an invalid value")
+            }
+            return client
+        }
+    }
+
+    func connected(self) -> bool {
+        go! {
+            state, ok := s.Raw.(*lamSshClientState)
+            if !ok || state == nil {
+                return false
+            }
+            state.Mu.RLock()
+            defer state.Mu.RUnlock()
+            return !state.Closed && state.Client != nil
+        }
+    }
+
+    func tryClose(self) -> Result {
+        go! {
+            state, ok := s.Raw.(*lamSshClientState)
+            if !ok || state == nil {
+                return LAMMERGEIER.Result.Ok(nil)
+            }
+            state.Mu.Lock()
+            if state.Closed || state.Client == nil {
+                state.Closed = true
+                state.Client = nil
+                state.Mu.Unlock()
+                return LAMMERGEIER.Result.Ok(nil)
+            }
+            client := state.Client
+            state.Closed = true
+            state.Client = nil
+            state.Mu.Unlock()
+            if err := client.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+                return lamSshClientResultError("SshCloseError", "could not close SSH client: "+err.Error())
+            }
+            return LAMMERGEIER.Result.Ok(nil)
+        }
+    }
+
+    func close(self) {
+        result: Result = self.tryClose()
+        if not result.ok() {
+            throw RuntimeError(str(result.error))
+        }
+    }
+
+    func tryRun(self, command: str) -> Result[SshCommandResult] {
+        requestContext: Context = Context.simple()
+        if self.config.commandTimeoutMs > 0 {
+            requestContext = requestContext.expirable(self.config.commandTimeoutMs, "milliseconds")
+        }
+        return self.tryRunContext(requestContext, command)
+    }
+
+    func run(self, command: str) -> SshCommandResult {
+        result: Result[SshCommandResult] = self.tryRun(command)
+        if not result.ok() {
+            throw RuntimeError(str(result.error))
+        }
+        go! {
+            commandResult, ok := result.Value.(*SshCommandResult)
+            if !ok {
+                panic("@lam/ssh internal error: command returned an invalid value")
+            }
+            return commandResult
+        }
+    }
+
+    func tryRunContext(self, requestContext: Context, command: str) -> Result[SshCommandResult] {
+        go! {
+            state, ok := s.Raw.(*lamSshClientState)
+            if !ok {
+                return lamSshClientResultError("SshClientClosed", "SSH client is not initialized")
+            }
+            nativeContext, contextErr := lamSshNativeContext(requestContext)
+            if contextErr != nil {
+                return lamSshClientResultError("SshContextError", contextErr.Error())
+            }
+            return lamSshExecute(nativeContext, state, command, s.Config.Environment, "")
+        }
+    }
+
+    func runContext(self, requestContext: Context, command: str) -> SshCommandResult {
+        result: Result[SshCommandResult] = self.tryRunContext(requestContext, command)
+        if not result.ok() {
+            throw RuntimeError(str(result.error))
+        }
+        go! {
+            commandResult, ok := result.Value.(*SshCommandResult)
+            if !ok {
+                panic("@lam/ssh internal error: command returned an invalid value")
+            }
+            return commandResult
+        }
+    }
+
+    func tryOpenSession(self) -> Result[SshSession] {
+        go! {
+            clientState, ok := s.Raw.(*lamSshClientState)
+            if !ok {
+                return lamSshClientResultError("SshClientClosed", "SSH client is not initialized")
+            }
+            if _, err := lamSshClientFromState(clientState); err != nil {
+                return lamSshClientResultError("SshClientClosed", err.Error())
+            }
+            sessionState := &lamSshSessionState{Client: clientState}
+            session := NewSshSession(s.Config.CommandTimeoutMs)
+            session.Raw = sessionState
+            for name, value := range s.Config.Environment {
+                session.Environment[name] = value
+            }
+            return LAMMERGEIER.Result.Ok(session)
+        }
+    }
+
+    func openSession(self) -> SshSession {
+        result: Result[SshSession] = self.tryOpenSession()
+        if not result.ok() {
+            throw RuntimeError(str(result.error))
+        }
+        go! {
+            session, ok := result.Value.(*SshSession)
+            if !ok {
+                panic("@lam/ssh internal error: openSession returned an invalid value")
+            }
+            return session
+        }
+    }
+
+    func tryDial(self, network: str, address: str) -> Result[SshTcpConn] {
+        if network != "tcp" and network != "tcp4" and network != "tcp6" {
+            return Result.Err(Error("SshDialError", "network must be tcp, tcp4, or tcp6", None))
+        }
+        if address.trim() == "" {
+            return Result.Err(Error("SshDialError", "address must not be empty", None))
+        }
+        go! {
+            state, ok := s.Raw.(*lamSshClientState)
+            if !ok {
+                return lamSshClientResultError("SshClientClosed", "SSH client is not initialized")
+            }
+            client, err := lamSshClientFromState(state)
+            if err != nil {
+                return lamSshClientResultError("SshClientClosed", err.Error())
+            }
+            conn, err := client.Dial(network, address)
+            if err != nil {
+                return lamSshClientResultError("SshDialError", "SSH direct TCP dial failed: "+err.Error())
+            }
+            wrapped := NewSshTcpConn()
+            wrapped.Raw = &lamSshTcpConnState{Conn: conn}
+            return LAMMERGEIER.Result.Ok(wrapped)
+        }
+    }
+
+    func tryDialTcp(self, host: str, port: int) -> Result[SshTcpConn] {
+        if host.trim() == "" {
+            return Result.Err(Error("SshDialError", "TCP host must not be empty", None))
+        }
+        if port < 1 or port > 65535 {
+            return Result.Err(Error("SshDialError", "TCP port must be between 1 and 65535", None))
+        }
+        go! {
+            address := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+            return s.TryDial("tcp", address)
+        }
+    }
+
+    func dialTcp(self, host: str, port: int) -> SshTcpConn {
+        result: Result[SshTcpConn] = self.tryDialTcp(host, port)
+        if not result.ok() {
+            throw RuntimeError(str(result.error))
+        }
+        go! {
+            connection, ok := result.Value.(*SshTcpConn)
+            if !ok {
+                panic("@lam/ssh internal error: dialTcp returned an invalid value")
+            }
+            return connection
+        }
+    }
+}
+
+# Reusable command template. Each run opens a fresh native SSH session while
+# preserving environment/stdin settings. Closing it does not close the client.
+class SshSession {
+    func __init__(self, commandTimeoutMs: int = 30000) {
+        self.raw: any = None
+        self.environment: dict[str, str] = {}
+        self.stdinData: str = ""
+        self.commandTimeoutMs: int = commandTimeoutMs
+    }
+
+    func env(self, name: str, value: str) -> SshSession {
+        if not sshValidEnvironmentName(name) {
+            throw ValueError("SSH environment variable name must be non-empty and must not contain '='")
+        }
+        self.environment[name] = value
+        return self
+    }
+
+    func stdin(self, data: str) -> SshSession {
+        self.stdinData = data
+        return self
+    }
+
+    func clearEnv(self) -> SshSession {
+        self.environment = {}
+        return self
+    }
+
+    func clearStdin(self) -> SshSession {
+        self.stdinData = ""
+        return self
+    }
+
+    func withCommandTimeout(self, timeoutMs: int) -> SshSession {
+        if timeoutMs < 0 {
+            throw ValueError("SSH command timeout must not be negative")
+        }
+        self.commandTimeoutMs = timeoutMs
+        return self
+    }
+
+    func closed(self) -> bool {
+        go! {
+            state, ok := s.Raw.(*lamSshSessionState)
+            if !ok || state == nil {
+                return true
+            }
+            state.Mu.RLock()
+            defer state.Mu.RUnlock()
+            return state.Closed
+        }
+    }
+
+    func tryRun(self, command: str) -> Result[SshCommandResult] {
+        requestContext: Context = Context.simple()
+        if self.commandTimeoutMs > 0 {
+            requestContext = requestContext.expirable(self.commandTimeoutMs, "milliseconds")
+        }
+        return self.tryRunContext(requestContext, command)
+    }
+
+    func run(self, command: str) -> SshCommandResult {
+        result: Result[SshCommandResult] = self.tryRun(command)
+        if not result.ok() {
+            throw RuntimeError(str(result.error))
+        }
+        go! {
+            commandResult, ok := result.Value.(*SshCommandResult)
+            if !ok {
+                panic("@lam/ssh internal error: command returned an invalid value")
+            }
+            return commandResult
+        }
+    }
+
+    func tryRunContext(self, requestContext: Context, command: str) -> Result[SshCommandResult] {
+        go! {
+            state, ok := s.Raw.(*lamSshSessionState)
+            if !ok || state == nil {
+                return lamSshClientResultError("SshSessionClosed", "SSH session is not initialized")
+            }
+            state.Mu.RLock()
+            closed := state.Closed
+            clientState := state.Client
+            state.Mu.RUnlock()
+            if closed {
+                return lamSshClientResultError("SshSessionClosed", "SSH session is closed")
+            }
+            nativeContext, contextErr := lamSshNativeContext(requestContext)
+            if contextErr != nil {
+                return lamSshClientResultError("SshContextError", contextErr.Error())
+            }
+            return lamSshExecute(nativeContext, clientState, command, s.Environment, s.StdinData)
+        }
+    }
+
+    func runContext(self, requestContext: Context, command: str) -> SshCommandResult {
+        result: Result[SshCommandResult] = self.tryRunContext(requestContext, command)
+        if not result.ok() {
+            throw RuntimeError(str(result.error))
+        }
+        go! {
+            commandResult, ok := result.Value.(*SshCommandResult)
+            if !ok {
+                panic("@lam/ssh internal error: command returned an invalid value")
+            }
+            return commandResult
+        }
+    }
+
+    func close(self) {
+        go! {
+            state, ok := s.Raw.(*lamSshSessionState)
+            if !ok || state == nil {
+                return
+            }
+            state.Mu.Lock()
+            state.Closed = true
+            state.Client = nil
+            state.Mu.Unlock()
+        }
+    }
+}
+
+# Typed net.Conn obtained through SSH direct-tcpip forwarding.
+class SshTcpConn {
+    func __init__(self) {
+        self.raw: any = None
+    }
+
+    func trySend(self, data: str) -> Result[int] {
+        go! {
+            state, ok := s.Raw.(*lamSshTcpConnState)
+            if !ok || state == nil {
+                return lamSshClientResultError("SshTcpClosed", "SSH TCP connection is not initialized")
+            }
+            state.Mu.RLock()
+            conn := state.Conn
+            closed := state.Closed
+            state.Mu.RUnlock()
+            if closed || conn == nil {
+                return lamSshClientResultError("SshTcpClosed", "SSH TCP connection is closed")
+            }
+            n, err := io.WriteString(conn, data)
+            if err != nil {
+                return lamSshClientResultError("SshTcpWriteError", "SSH TCP write failed: "+err.Error())
+            }
+            return LAMMERGEIER.Result.Ok(n)
+        }
+    }
+
+    func send(self, data: str) -> int {
+        result: Result[int] = self.trySend(data)
+        if not result.ok() {
+            throw RuntimeError(str(result.error))
+        }
+        go! {
+            written, ok := result.Value.(int)
+            if !ok {
+                panic("@lam/ssh internal error: send returned an invalid value")
+            }
+            return written
+        }
+    }
+
+    func tryRecv(self, maxBytes: int = 4096) -> Result[str] {
+        if maxBytes <= 0 or maxBytes > 16777216 {
+            return Result.Err(Error("SshTcpReadError", "maxBytes must be between 1 and 16777216", None))
+        }
+        go! {
+            state, ok := s.Raw.(*lamSshTcpConnState)
+            if !ok || state == nil {
+                return lamSshClientResultError("SshTcpClosed", "SSH TCP connection is not initialized")
+            }
+            state.Mu.RLock()
+            conn := state.Conn
+            closed := state.Closed
+            state.Mu.RUnlock()
+            if closed || conn == nil {
+                return lamSshClientResultError("SshTcpClosed", "SSH TCP connection is closed")
+            }
+            buffer := make([]byte, maxBytes)
+            n, err := conn.Read(buffer)
+            if err != nil && !errors.Is(err, io.EOF) {
+                return lamSshClientResultError("SshTcpReadError", "SSH TCP read failed: "+err.Error())
+            }
+            return LAMMERGEIER.Result.Ok(string(buffer[:n]))
+        }
+    }
+
+    func recv(self, maxBytes: int = 4096) -> str {
+        result: Result[str] = self.tryRecv(maxBytes)
+        if not result.ok() {
+            throw RuntimeError(str(result.error))
+        }
+        go! {
+            data, ok := result.Value.(string)
+            if !ok {
+                panic("@lam/ssh internal error: recv returned an invalid value")
+            }
+            return data
+        }
+    }
+
+    func setDeadline(self, timeoutMs: int) -> Result {
+        if timeoutMs < 0 {
+            return Result.Err(Error("SshTcpDeadlineError", "deadline timeout must not be negative", None))
+        }
+        go! {
+            state, ok := s.Raw.(*lamSshTcpConnState)
+            if !ok || state == nil {
+                return lamSshClientResultError("SshTcpClosed", "SSH TCP connection is not initialized")
+            }
+            state.Mu.RLock()
+            conn := state.Conn
+            closed := state.Closed
+            state.Mu.RUnlock()
+            if closed || conn == nil {
+                return lamSshClientResultError("SshTcpClosed", "SSH TCP connection is closed")
+            }
+            deadline := time.Time{}
+            if timeoutMs > 0 {
+                deadline = time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+            }
+            if err := conn.SetDeadline(deadline); err != nil {
+                return lamSshClientResultError("SshTcpDeadlineError", "could not set SSH TCP deadline: "+err.Error())
+            }
+            return LAMMERGEIER.Result.Ok(nil)
+        }
+    }
+
+    func remoteAddr(self) -> str {
+        go! {
+            state, ok := s.Raw.(*lamSshTcpConnState)
+            if !ok || state == nil {
+                return ""
+            }
+            state.Mu.RLock()
+            defer state.Mu.RUnlock()
+            if state.Closed || state.Conn == nil {
+                return ""
+            }
+            return state.Conn.RemoteAddr().String()
+        }
+    }
+
+    func localAddr(self) -> str {
+        go! {
+            state, ok := s.Raw.(*lamSshTcpConnState)
+            if !ok || state == nil {
+                return ""
+            }
+            state.Mu.RLock()
+            defer state.Mu.RUnlock()
+            if state.Closed || state.Conn == nil {
+                return ""
+            }
+            return state.Conn.LocalAddr().String()
+        }
+    }
+
+    func close(self) {
+        go! {
+            state, ok := s.Raw.(*lamSshTcpConnState)
+            if !ok || state == nil {
+                return
+            }
+            state.Mu.Lock()
+            if state.Closed || state.Conn == nil {
+                state.Closed = true
+                state.Conn = nil
+                state.Mu.Unlock()
+                return
+            }
+            conn := state.Conn
+            state.Closed = true
+            state.Conn = nil
+            state.Mu.Unlock()
+            _ = conn.Close()
+        }
+    }
+}

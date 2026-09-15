@@ -1,0 +1,177 @@
+# Ed25519 SSH key generation, parsing, and file loading.
+#
+# Secure Ed25519 generation is delegated to lamcrypto. Only conversion from its
+# portable PKCS#8/PKIX CryptoKeyPair into OpenSSH and authorized-key forms stays
+# at the unavoidable x/crypto/ssh boundary. File loading remains in Lam/lamos.
+
+from lamerrors import Result, Error
+from lamcrypto import Crypto, CryptoKeyPair
+from lamos import Os
+
+go! {
+    import (
+        "encoding/pem"
+        "fmt"
+        "strings"
+
+        gossh "golang.org/x/crypto/ssh"
+    )
+
+    func lamSshKeyError(kind, message string) *Result {
+        return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(kind, message, nil))
+    }
+
+    func lamSshParsePrivateKey(privatePEM, passphrase string) (gossh.Signer, error) {
+        if strings.TrimSpace(privatePEM) == "" {
+            return nil, fmt.Errorf("private key is empty")
+        }
+        if passphrase != "" {
+            return gossh.ParsePrivateKeyWithPassphrase([]byte(privatePEM), []byte(passphrase))
+        }
+        return gossh.ParsePrivateKey([]byte(privatePEM))
+    }
+
+    func lamSshPublicKeyValue(key gossh.PublicKey, comment string) *SshKey {
+        authorized := strings.TrimSpace(string(gossh.MarshalAuthorizedKey(key)))
+        if comment != "" {
+            authorized += " " + comment
+        }
+        out := NewSshKey(key.Type(), authorized, gossh.FingerprintSHA256(key), comment)
+        out.Raw = key
+        return out
+    }
+}
+
+# Parsed public SSH key material with authorized_keys and SHA256 forms.
+class SshKey {
+    func __init__(self, keyType: str, authorizedKey: str, fingerprint: str, comment: str = "") {
+        self.keyType: str = keyType
+        self.authorizedKey: str = authorizedKey
+        self.fingerprint: str = fingerprint
+        self.comment: str = comment
+        self.raw: any = None
+    }
+
+    static func fromAuthorizedKey(encoded: str) -> Result[SshKey] {
+        if encoded.trim() == "" {
+            return Result.Err(Error("SshKeyError", "authorized public key must not be empty", None))
+        }
+        go! {
+            key, comment, _, rest, err := gossh.ParseAuthorizedKey([]byte(encoded))
+            if err != nil {
+                return lamSshKeyError("SshKeyParseError", "could not parse authorized public key: "+err.Error())
+            }
+            if strings.TrimSpace(string(rest)) != "" {
+                return lamSshKeyError("SshKeyParseError", "public-key input must contain exactly one authorized key")
+            }
+            return LAMMERGEIER.Result.Ok(lamSshPublicKeyValue(key, comment))
+        }
+    }
+
+    static func fromFile(path: str) -> Result[SshKey] {
+        if path.trim() == "" {
+            return Result.Err(Error("SshKeyFileError", "public-key path must not be empty", None))
+        }
+        loaded: Result[str] = Os.tryReadFile(path)
+        if not loaded.ok() {
+            return Result.Err(Error("SshKeyFileError", "could not read public-key file", loaded.error))
+        }
+        content: str = str(loaded.unwrap())
+        return SshKey.fromAuthorizedKey(content)
+    }
+
+    func authorizedPublicKey(self) -> str {
+        return self.authorizedKey
+    }
+
+    func sha256Fingerprint(self) -> str {
+        return self.fingerprint
+    }
+
+    func isEd25519(self) -> bool {
+        return self.keyType == "ssh-ed25519"
+    }
+}
+
+# Private OpenSSH key plus its derived public key. Treat privateKeyPem as a
+# secret and do not log or serialize this object.
+class SshKeyPair {
+    func __init__(self, privateKeyPem: str, publicKey: SshKey, encrypted: bool = false) {
+        self.privateKeyPem: str = privateKeyPem
+        self.publicKey: SshKey = publicKey
+        self.encrypted: bool = encrypted
+    }
+
+    static func generateEd25519(comment: str = "", passphrase: str = "") -> Result[SshKeyPair] {
+        generated: Result = Crypto.tryGenerateEd25519KeyPair()
+        if not generated.ok() {
+            return Result.Err(Error("SshKeyGenerationError", "lamcrypto could not generate an Ed25519 key pair", generated.error))
+        }
+        go! {
+            cryptoPair, ok := generated.Value.(*CryptoKeyPair)
+            if !ok || cryptoPair == nil || cryptoPair.Algorithm != "Ed25519" {
+                return lamSshKeyError("SshKeyGenerationError", "lamcrypto returned an invalid Ed25519 key pair")
+            }
+            privateKey, err := gossh.ParseRawPrivateKey([]byte(cryptoPair.PrivateKey))
+            if err != nil {
+                return lamSshKeyError("SshKeyGenerationError", "could not convert lamcrypto private key to SSH: "+err.Error())
+            }
+            signer, err := gossh.NewSignerFromKey(privateKey)
+            if err != nil {
+                return lamSshKeyError("SshKeyGenerationError", "could not derive SSH public key: "+err.Error())
+            }
+
+            var block *pem.Block
+            if passphrase != "" {
+                block, err = gossh.MarshalPrivateKeyWithPassphrase(privateKey, comment, []byte(passphrase))
+            } else {
+                block, err = gossh.MarshalPrivateKey(privateKey, comment)
+            }
+            if err != nil {
+                return lamSshKeyError("SshKeyGenerationError", "could not encode OpenSSH private key: "+err.Error())
+            }
+
+            privatePEM := string(pem.EncodeToMemory(block))
+            public := lamSshPublicKeyValue(signer.PublicKey(), comment)
+            return LAMMERGEIER.Result.Ok(NewSshKeyPair(privatePEM, public, passphrase != ""))
+        }
+    }
+
+    static func generateHostEd25519(comment: str = "lam-ssh host key", passphrase: str = "") -> Result[SshKeyPair] {
+        return SshKeyPair.generateEd25519(comment, passphrase)
+    }
+
+    static func fromPrivateKey(privateKeyPem: str, passphrase: str = "", comment: str = "") -> Result[SshKeyPair] {
+        if privateKeyPem.trim() == "" {
+            return Result.Err(Error("SshKeyParseError", "private key must not be empty", None))
+        }
+        go! {
+            signer, err := lamSshParsePrivateKey(privateKeyPem, passphrase)
+            if err != nil {
+                return lamSshKeyError("SshKeyParseError", "could not parse SSH private key: "+err.Error())
+            }
+            public := lamSshPublicKeyValue(signer.PublicKey(), comment)
+            return LAMMERGEIER.Result.Ok(NewSshKeyPair(privateKeyPem, public, passphrase != ""))
+        }
+    }
+
+    static func fromPrivateKeyFile(path: str, passphrase: str = "", comment: str = "") -> Result[SshKeyPair] {
+        if path.trim() == "" {
+            return Result.Err(Error("SshKeyFileError", "private-key path must not be empty", None))
+        }
+        loaded: Result[str] = Os.tryReadFile(path)
+        if not loaded.ok() {
+            return Result.Err(Error("SshKeyFileError", "could not read private-key file", loaded.error))
+        }
+        privateKeyPem: str = str(loaded.unwrap())
+        return SshKeyPair.fromPrivateKey(privateKeyPem, passphrase, comment)
+    }
+
+    func authorizedPublicKey(self) -> str {
+        return self.publicKey.authorizedPublicKey()
+    }
+
+    func sha256Fingerprint(self) -> str {
+        return self.publicKey.sha256Fingerprint()
+    }
+}

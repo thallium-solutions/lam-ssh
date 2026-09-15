@@ -1,0 +1,185 @@
+# Configuration and Lam-side validation for @lam/ssh.
+
+from lamerrors import Result, Error
+
+func _sshConfigError(message: str) -> Result {
+    return Result.Err(Error("SshConfigError", message, None))
+}
+
+func sshValidEnvironmentName(name: str) -> bool {
+    if name == "" {
+        return false
+    }
+    if name.contains("=") {
+        return false
+    }
+    return true
+}
+
+# Connection, authentication, host-verification, and timeout settings.
+# Host-key verification is mandatory unless the explicit insecure opt-out is
+# enabled. Never print or serialize a populated config.
+class SshConfig {
+    func __init__(self, host: str, username: str, port: int = 22) {
+        self.host: str = host
+        self.username: str = username
+        self.port: int = port
+
+        self.password: str = ""
+        self.privateKeyPem: str = ""
+        self.privateKeyPath: str = ""
+        self.privateKeyPassphrase: str = ""
+
+        self.connectTimeoutMs: int = 10000
+        self.handshakeTimeoutMs: int = 10000
+        self.commandTimeoutMs: int = 30000
+
+        self.environment: dict[str, str] = {}
+        self.knownHostsFiles: list[str] = []
+        self.hostKeyFingerprint: str = ""
+        self.insecureIgnoreHostKey: bool = false
+    }
+
+    func withPassword(self, password: str) -> SshConfig {
+        self.password = password
+        return self
+    }
+
+    func withPrivateKey(self, privateKeyPem: str, passphrase: str = "") -> SshConfig {
+        self.privateKeyPem = privateKeyPem
+        self.privateKeyPath = ""
+        self.privateKeyPassphrase = passphrase
+        return self
+    }
+
+    func withPrivateKeyFile(self, path: str, passphrase: str = "") -> SshConfig {
+        self.privateKeyPath = path
+        self.privateKeyPem = ""
+        self.privateKeyPassphrase = passphrase
+        return self
+    }
+
+    func atPort(self, port: int) -> SshConfig {
+        self.port = port
+        return self
+    }
+
+    func withTimeouts(self, connectTimeoutMs: int, handshakeTimeoutMs: int, commandTimeoutMs: int) -> SshConfig {
+        self.connectTimeoutMs = connectTimeoutMs
+        self.handshakeTimeoutMs = handshakeTimeoutMs
+        self.commandTimeoutMs = commandTimeoutMs
+        return self
+    }
+
+    func withConnectTimeout(self, timeoutMs: int) -> SshConfig {
+        self.connectTimeoutMs = timeoutMs
+        return self
+    }
+
+    func withHandshakeTimeout(self, timeoutMs: int) -> SshConfig {
+        self.handshakeTimeoutMs = timeoutMs
+        return self
+    }
+
+    func withCommandTimeout(self, timeoutMs: int) -> SshConfig {
+        self.commandTimeoutMs = timeoutMs
+        return self
+    }
+
+    func withEnv(self, name: str, value: str) -> SshConfig {
+        self.environment[name] = value
+        return self
+    }
+
+    func withEnvironment(self, environment: dict[str, str]) -> SshConfig {
+        self.environment = environment
+        return self
+    }
+
+    func withKnownHosts(self, path: str) -> SshConfig {
+        self.knownHostsFiles.append(path)
+        self.insecureIgnoreHostKey = false
+        return self
+    }
+
+    func withHostKeyFingerprint(self, fingerprint: str) -> SshConfig {
+        self.hostKeyFingerprint = fingerprint.trim()
+        self.insecureIgnoreHostKey = false
+        return self
+    }
+
+    # Explicit security opt-out. Pass True only for controlled tests.
+    func insecureSkipHostKeyVerification(self, acknowledgeRisk: bool) -> SshConfig {
+        self.insecureIgnoreHostKey = acknowledgeRisk
+        return self
+    }
+
+    func usesPassword(self) -> bool {
+        return self.password != ""
+    }
+
+    func usesPrivateKey(self) -> bool {
+        return self.privateKeyPem != "" or self.privateKeyPath != ""
+    }
+
+    func verifiesHostKey(self) -> bool {
+        return len(self.knownHostsFiles) > 0 or self.hostKeyFingerprint != ""
+    }
+
+    func address(self) -> str {
+        return f"{self.host}:{self.port}"
+    }
+
+    func validate(self) -> Result[SshConfig] {
+        if self.host.trim() == "" {
+            return _sshConfigError("host must not be empty")
+        }
+        if self.username.trim() == "" {
+            return _sshConfigError("username must not be empty")
+        }
+        if self.port < 1 or self.port > 65535 {
+            return _sshConfigError("port must be between 1 and 65535")
+        }
+        if self.connectTimeoutMs <= 0 {
+            return _sshConfigError("connect timeout must be greater than zero")
+        }
+        if self.handshakeTimeoutMs <= 0 {
+            return _sshConfigError("handshake timeout must be greater than zero")
+        }
+        if self.commandTimeoutMs < 0 {
+            return _sshConfigError("command timeout must not be negative")
+        }
+        if not self.usesPassword() and not self.usesPrivateKey() {
+            return _sshConfigError("at least one password or private-key authentication method is required")
+        }
+        if self.privateKeyPath != "" and self.privateKeyPath.trim() == "" {
+            return _sshConfigError("private-key path must not be blank")
+        }
+        if self.insecureIgnoreHostKey and self.verifiesHostKey() {
+            return _sshConfigError("insecure host-key opt-out cannot be combined with known_hosts or fingerprint verification")
+        }
+        if not self.insecureIgnoreHostKey and not self.verifiesHostKey() {
+            return _sshConfigError("strict host-key verification requires known_hosts and/or a SHA256 fingerprint; insecure opt-out must be explicit")
+        }
+        if self.hostKeyFingerprint != "" and not self.hostKeyFingerprint.startsWith("SHA256:") {
+            return _sshConfigError("host-key fingerprint must use the SHA256:<base64> format")
+        }
+        if self.hostKeyFingerprint == "SHA256:" {
+            return _sshConfigError("host-key fingerprint body must not be empty")
+        }
+        if self.hostKeyFingerprint != "" and len(self.hostKeyFingerprint) != 50 {
+            return _sshConfigError("host-key fingerprint must contain one unpadded SHA256 digest")
+        }
+        for path in self.knownHostsFiles {
+            if path.trim() == "" {
+                return _sshConfigError("known_hosts path must not be empty")
+            }
+        }
+        for name, value in self.environment {
+            if not sshValidEnvironmentName(name) {
+                return _sshConfigError("environment variable names must be non-empty and must not contain '='")
+            }
+        }
+        return Result.Ok(self)
+    }
+}

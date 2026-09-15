@@ -1,0 +1,25 @@
+# Compatibility names for context-aware SSH operations.
+#
+# New code should import and use lamcontext.Context directly. @lam/ssh
+# re-exports Context so callers do not need a second import. SshContext is a
+# stateless convenience facade and every method returns a stdlib Context value.
+
+from lamcontext import Context
+
+class SshContext {
+    static func simple() -> Context {
+        return Context.simple()
+    }
+
+    static func cancellable() -> Context {
+        return Context.simple().cancellable()
+    }
+
+    static func expirable(expiration: int, unit: any = None) -> Context {
+        return Context.simple().expirable(expiration, unit)
+    }
+
+    static func cancelled(reason: any = "cancelled") -> Context {
+        return Context.cancelled(reason)
+    }
+}

@@ -1,0 +1,3 @@
+# Compatibility re-exports for historical ``ssh.config`` imports.
+
+from ..ssh_config import SshConfig, sshValidEnvironmentName

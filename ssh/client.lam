@@ -1,0 +1,3 @@
+# Compatibility re-exports for historical ``ssh.client`` imports.
+
+from ..ssh_client import SshConfig, Context, SshContext, SshKey, SshKeyPair, SshClient, SshSession, SshCommandResult, SshTcpConn

@@ -1,0 +1,14 @@
+# The generated flat ssh.lam shim remains a working local-development export.
+
+from lamtest import Test
+from ssh import SshConfig, Context, tag
+
+func main() {
+    _ = Test.assertEqual(tag(), "@lam/ssh@1.0.0", "flat export keeps stable tag")
+    config: SshConfig = SshConfig("localhost", "user").withPassword("not-logged")
+    config.insecureSkipHostKeyVerification(True)
+    _ = Test.assertTrue(config.validate().ok(), "flat export re-exports public classes")
+    context: Context = Context.cancelled("flat export")
+    _ = Test.assertTrue(context.expired(), "flat export re-exports lamcontext.Context")
+    _summary: int = Test.summary()
+}

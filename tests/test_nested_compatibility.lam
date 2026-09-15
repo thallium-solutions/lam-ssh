@@ -1,0 +1,16 @@
+# Historical nested modules are thin parent-relative compatibility re-exports.
+
+from lamtest import Test
+from ssh.config import SshConfig
+from ssh.context import Context
+from ssh.key import SshKeyPair
+
+func main() {
+    config: SshConfig = SshConfig("localhost", "user").withPassword("not-logged")
+    config.insecureSkipHostKeyVerification(True)
+    _ = Test.assertTrue(config.validate().ok(), "nested config module reaches root implementation")
+    context: Context = Context.cancelled("nested compatibility")
+    _ = Test.assertTrue(context.expired(), "nested context module reaches root implementation")
+    _ = Test.assertTrue(SshKeyPair.generateEd25519("compatibility", "").ok(), "nested key module reaches root implementation")
+    _summary: int = Test.summary()
+}

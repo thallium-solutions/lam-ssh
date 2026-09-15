@@ -1,0 +1,94 @@
+# Consumer-style offline assertions against the public export point.
+
+from lamcrypto import Crypto, CryptoKeyPair
+from lamerrors import Result
+from lamtest import Test
+from @lam/ssh import SshConfig, Context, SshContext, SshKey, SshKeyPair
+
+func checkKeys() -> Result {
+    cryptoPair: CryptoKeyPair = Crypto.tryGenerateEd25519KeyPair()?
+    _ = Test.assertTrue(cryptoPair.algorithm == "Ed25519" and cryptoPair.bits == 256, "lamcrypto Ed25519 source metadata")
+    _ = Test.assertTrue(cryptoPair.privateKey.startsWith("-----BEGIN PRIVATE KEY-----"), "lamcrypto Ed25519 source PEM")
+
+    pair: SshKeyPair = SshKeyPair.generateEd25519("offline@example")?
+    _ = Test.assertTrue(pair.privateKeyPem.startsWith("-----BEGIN OPENSSH PRIVATE KEY-----"), "generated OpenSSH private key")
+    _ = Test.assertTrue(pair.publicKey.isEd25519(), "generated public key is Ed25519")
+    authorized: str = pair.authorizedPublicKey()
+    fingerprint: str = pair.sha256Fingerprint()
+    _ = Test.assertTrue(authorized.startsWith("ssh-ed25519 "), "authorized-key encoding")
+    _ = Test.assertTrue(fingerprint.startsWith("SHA256:"), "OpenSSH SHA256 fingerprint")
+    _ = Test.assertEqual(pair.publicKey.comment, "offline@example", "public-key comment round trip")
+
+    reparsed: SshKeyPair = SshKeyPair.fromPrivateKey(pair.privateKeyPem, "", "reparsed")?
+    _ = Test.assertEqual(reparsed.sha256Fingerprint(), pair.sha256Fingerprint(), "private-key parse preserves fingerprint")
+
+    publicOnly: SshKey = SshKey.fromAuthorizedKey(pair.authorizedPublicKey())?
+    _ = Test.assertEqual(publicOnly.sha256Fingerprint(), pair.sha256Fingerprint(), "authorized-key parse preserves fingerprint")
+
+    encrypted: SshKeyPair = SshKeyPair.generateEd25519("encrypted", "test-passphrase")?
+    _ = Test.assertTrue(encrypted.encrypted, "encrypted key reports encryption")
+    _ = Test.assertFalse(SshKeyPair.fromPrivateKey(encrypted.privateKeyPem, "wrong").ok(), "wrong key passphrase is rejected")
+    unlocked: SshKeyPair = SshKeyPair.fromPrivateKey(encrypted.privateKeyPem, "test-passphrase")?
+    _ = Test.assertEqual(unlocked.sha256Fingerprint(), encrypted.sha256Fingerprint(), "encrypted private-key parse")
+    return Result.Ok(None)
+}
+
+func main() {
+    missingAuth: SshConfig = SshConfig("localhost", "user")
+    missingAuth.insecureSkipHostKeyVerification(True)
+    _ = Test.assertFalse(missingAuth.validate().ok(), "authentication is required")
+
+    missingVerification: SshConfig = SshConfig("localhost", "user").withPassword("not-logged")
+    _ = Test.assertFalse(missingVerification.validate().ok(), "host verification is strict by default")
+
+    insecure: SshConfig = SshConfig("localhost", "user").withPassword("not-logged")
+    insecure.insecureSkipHostKeyVerification(True)
+    _ = Test.assertTrue(insecure.validate().ok(), "insecure opt-out is explicit")
+
+    strict: SshConfig = SshConfig("example.invalid", "user").withPassword("not-logged")
+    strict.withHostKeyFingerprint("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    strict.withEnv("LANG", "C").withTimeouts(100, 200, 300)
+    _ = Test.assertTrue(strict.validate().ok(), "strict fingerprint config validates")
+    _ = Test.assertTrue(strict.verifiesHostKey(), "strict config reports verification")
+    _ = Test.assertEqual(strict.address(), "example.invalid:22", "config address")
+    _ = Test.assertEqual(strict.environment["LANG"], "C", "config environment builder")
+
+    malformedFingerprint: SshConfig = SshConfig("localhost", "user").withPassword("not-logged")
+    malformedFingerprint.withHostKeyFingerprint("SHA256:short")
+    _ = Test.assertFalse(malformedFingerprint.validate().ok(), "malformed SHA256 fingerprint is rejected")
+
+    badPort: SshConfig = SshConfig("localhost", "user", 70000).withPassword("not-logged")
+    badPort.insecureSkipHostKeyVerification(True)
+    _ = Test.assertFalse(badPort.validate().ok(), "invalid port is rejected")
+
+    conflicting: SshConfig = SshConfig("localhost", "user").withPassword("not-logged")
+    conflicting.withKnownHosts("/tmp/known_hosts").insecureSkipHostKeyVerification(True)
+    _ = Test.assertFalse(conflicting.validate().ok(), "strict and insecure verification cannot be mixed")
+
+    invalidEnvironment: SshConfig = SshConfig("localhost", "user").withPassword("not-logged")
+    invalidEnvironment.insecureSkipHostKeyVerification(True).withEnv("BAD=NAME", "value")
+    _ = Test.assertFalse(invalidEnvironment.validate().ok(), "invalid environment name is rejected")
+
+    context: Context = Context.simple().cancellable()
+    _ = Test.assertFalse(context.expired(), "stdlib Context starts active")
+    _ = Test.assertNotNil(context.native(), "Context.native exposes the SSH Go boundary")
+    context.cancel("offline cancellation")
+    _ = Test.assertTrue(context.expired(), "stdlib Context cancellation is observed")
+    _ = Test.assertEqual(context.reason(), "offline cancellation", "stdlib Context reason is retained")
+
+    timeout: Context = Context.simple().expirable(5, "milliseconds")
+    _ = Test.assertTrue(timeout.wait(100), "stdlib Context expiration completes")
+    _ = Test.assertTrue(timeout.expired(), "stdlib Context reports expiration")
+    timeout.cancel("cleanup")
+
+    compatibility: Context = SshContext.cancellable()
+    _ = Test.assertFalse(compatibility.expired(), "SshContext facade returns Context")
+    compatibility.cancel("cleanup")
+
+    keyChecks: Result = checkKeys()
+    _ = Test.assertTrue(keyChecks.ok(), "offline key checks complete")
+    _ = Test.assertFalse(SshKey.fromFile("/definitely/not/a/lam-ssh-key.pub").ok(), "missing public-key file returns Result.Err")
+    _ = Test.assertFalse(SshKeyPair.fromPrivateKeyFile("/definitely/not/a/lam-ssh-key").ok(), "missing private-key file returns Result.Err")
+
+    _summary: int = Test.summary()
+}

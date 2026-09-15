@@ -1,0 +1,3 @@
+# Compatibility re-exports for historical ``ssh.key`` imports.
+
+from ..ssh_key import SshKey, SshKeyPair

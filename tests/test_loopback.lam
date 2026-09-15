@@ -1,0 +1,130 @@
+# End-to-end loopback assertions for password/key auth, host verification,
+# commands, cancellation, reusable sessions, and direct TCP dialing.
+
+from lamerrors import Result
+from lamos import Os
+from lamtest import Test
+from @lam/ssh import SshConfig, Context, SshKeyPair, SshClient, SshSession, SshCommandResult, SshTcpConn
+from loopback_server import LoopbackSshServer
+
+func passwordConfig(server: LoopbackSshServer) -> SshConfig {
+    config: SshConfig = SshConfig("127.0.0.1", "tester", server.port)
+    config.withPassword("loopback-secret")
+    config.withHostKeyFingerprint(server.fingerprint)
+    config.withTimeouts(1000, 1000, 1000)
+    config.withEnv("LAM_SSH_DEFAULT", "configured")
+    return config
+}
+
+func checkPasswordClient(server: LoopbackSshServer) -> Result {
+    client: SshClient = SshClient.tryConnect(passwordConfig(server))?
+    _ = Test.assertTrue(client.connected(), "password client connects with fingerprint verification")
+
+    hello: SshCommandResult = client.tryRun("printf hello")?
+    _ = Test.assertTrue(hello.success, "successful command is marked successful")
+    _ = Test.assertEqual(hello.exitCode, 0, "successful command exit code")
+    _ = Test.assertEqual(hello.stdout, "hello", "command stdout is captured")
+    _ = Test.assertEqual(hello.stderr, "", "command stderr is separate")
+
+    configured: SshCommandResult = client.tryRun("printf %s \"$LAM_SSH_DEFAULT\"")?
+    _ = Test.assertEqual(configured.stdout, "configured", "config environment reaches command")
+
+    failed: SshCommandResult = client.tryRun("printf problem >&2; exit 7")?
+    _ = Test.assertFalse(failed.success, "nonzero command is a typed result, not transport failure")
+    _ = Test.assertEqual(failed.exitCode, 7, "nonzero exit code is preserved")
+    _ = Test.assertEqual(failed.stderr, "problem", "failed command stderr is captured")
+
+    session: SshSession = client.tryOpenSession()?
+    session.env("LAM_SSH_SESSION", "session-value").stdin("payload")
+    first: SshCommandResult = session.tryRun("printf %s: \"$LAM_SSH_SESSION\"; cat")?
+    _ = Test.assertEqual(first.stdout, "session-value:payload", "session env and stdin are applied")
+
+    session.clearStdin()
+    second: SshCommandResult = session.tryRun("printf %s \"$LAM_SSH_SESSION\"")?
+    _ = Test.assertEqual(second.stdout, "session-value", "session template is reusable")
+
+    cancelled: Context = Context.cancelled("loopback cancelled")
+    _ = Test.assertTrue(cancelled.expired(), "context-aware API accepts cancelled stdlib Context")
+    _ = Test.assertFalse(client.tryRunContext(cancelled, "printf never").ok(), "pre-cancelled Context returns Result.Err")
+
+    deadline: Context = Context.simple().expirable(30, "milliseconds")
+    _ = Test.assertFalse(session.tryRunContext(deadline, "sleep 2").ok(), "running command is cancelled at Context expiration")
+    _ = Test.assertTrue(deadline.expired(), "expirable Context reports completion")
+    _ = Test.assertEqual(deadline.reason(), "deadline exceeded", "SSH cancellation preserves Context expiration reason")
+    deadline.cancel("cleanup")
+
+    tunnel: SshTcpConn = client.tryDialTcp("127.0.0.1", server.echoPort)?
+    _ = Test.assertFalse(tunnel.setDeadline(1000).ok(), "unsupported SSH-channel deadline is reported safely")
+    _ = Test.assertEqual(tunnel.send("echo-through-ssh"), 16, "TCP tunnel reports bytes written")
+    _ = Test.assertEqual(tunnel.recv(64), "echo-through-ssh", "direct-tcpip tunnel carries loopback data")
+    _ = Test.assertTrue(tunnel.remoteAddr() != "", "TCP tunnel exposes remote address")
+    tunnel.close()
+    _ = Test.assertFalse(tunnel.trySend("closed").ok(), "closed TCP tunnel rejects writes")
+
+    session.close()
+    _ = Test.assertTrue(session.closed(), "session close updates state")
+    _ = Test.assertFalse(session.tryRun("printf never").ok(), "closed session rejects commands")
+
+    client.close()
+    _ = Test.assertFalse(client.connected(), "client close updates state")
+    _ = Test.assertFalse(client.tryRun("printf never").ok(), "closed client rejects commands")
+    _ = Test.assertTrue(client.tryClose().ok(), "client close is idempotent")
+    return Result.Ok(None)
+}
+
+func checkKnownHosts(server: LoopbackSshServer) -> Result {
+    path: str = Os.tempFile("lam-ssh-known-hosts-", "")
+    Os.writeFile(path, server.knownHostsEntry + "\n")
+
+    config: SshConfig = SshConfig("127.0.0.1", "tester", server.port)
+    config.withPassword("loopback-secret").withKnownHosts(path)
+    config.withTimeouts(1000, 1000, 1000)
+    client: SshClient = SshClient.tryConnect(config)?
+    result: SshCommandResult = client.tryRun("printf known-hosts")?
+    _ = Test.assertEqual(result.stdout, "known-hosts", "known_hosts verification connects")
+    client.close()
+    Os.remove(path)
+    return Result.Ok(None)
+}
+
+func checkRejectedConnections(server: LoopbackSshServer) {
+    badFingerprint: SshConfig = passwordConfig(server)
+    badFingerprint.withHostKeyFingerprint("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    _ = Test.assertFalse(SshClient.tryConnect(badFingerprint).ok(), "incorrect host fingerprint is rejected")
+
+    badPassword: SshConfig = SshConfig("127.0.0.1", "tester", server.port)
+    badPassword.withPassword("incorrect").withHostKeyFingerprint(server.fingerprint)
+    badPassword.withTimeouts(1000, 1000, 1000)
+    _ = Test.assertFalse(SshClient.tryConnect(badPassword).ok(), "incorrect password is rejected")
+}
+
+func checkKeyAuthentication() -> Result {
+    pair: SshKeyPair = SshKeyPair.generateEd25519("loopback-user")?
+    server: LoopbackSshServer = LoopbackSshServer.start("tester", "unused-password", pair.authorizedPublicKey())
+
+    config: SshConfig = SshConfig("127.0.0.1", "tester", server.port)
+    config.withPrivateKey(pair.privateKeyPem)
+    config.withHostKeyFingerprint(server.fingerprint)
+    config.withTimeouts(1000, 1000, 1000)
+    client: SshClient = SshClient.tryConnect(config)?
+    result: SshCommandResult = client.tryRun("printf key-auth")?
+    _ = Test.assertEqual(result.stdout, "key-auth", "Ed25519 private-key authentication connects")
+    client.close()
+    server.close()
+    return Result.Ok(None)
+}
+
+func main() {
+    server: LoopbackSshServer = LoopbackSshServer.start()
+    passwordChecks: Result = checkPasswordClient(server)
+    _ = Test.assertTrue(passwordChecks.ok(), "password client loopback checks complete")
+
+    knownHostsChecks: Result = checkKnownHosts(server)
+    _ = Test.assertTrue(knownHostsChecks.ok(), "known_hosts loopback checks complete")
+    checkRejectedConnections(server)
+    server.close()
+
+    keyChecks: Result = checkKeyAuthentication()
+    _ = Test.assertTrue(keyChecks.ok(), "private-key loopback checks complete")
+    _summary: int = Test.summary()
+}

@@ -1,0 +1,21 @@
+[library]
+name        = "@lam/ssh"
+version     = "1.0.0"
+description = "Production-minded SSH client, sessions, keys, and direct TCP dialing for Lammergeier"
+license     = "Apache-2.0"
+authors     = ["Thallium Solutions"]
+homepage    = "https://github.com/thallium-solutions/lam-ssh"
+repository  = "https://github.com/thallium-solutions/lam-ssh"
+
+[compatibility]
+lamc = "^1.16"
+
+[dependencies]
+
+[go-deps]
+"golang.org/x/crypto" = "v0.55.0"
+
+[scripts]
+test   = "python3 tests/run_tests.py"
+format = "lamc fmt ."
+check  = "lamc fmt . --check"

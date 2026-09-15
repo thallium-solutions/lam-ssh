@@ -1,0 +1,21 @@
+# Reproduce a scoped dependent package such as @lam/sftp with its own
+# config.lam and tag while it composes canonical @lam/ssh from one extlibs root.
+
+from lamerrors import Result
+from lamtest import Test
+from @lam/ssh_composition import CompositionConfig, generatedKeyType, tag
+
+func checkGeneratedKey() -> Result {
+    keyType: str = generatedKeyType()?
+    _ = Test.assertEqual(keyType, "ssh-ed25519", "scoped dependent uses @lam/ssh SshKeyPair")
+    return Result.Ok(None)
+}
+
+func main() {
+    config: CompositionConfig = CompositionConfig()
+    _ = Test.assertEqual(config.name, "sftp-shape", "dependent package owns config.lam")
+    _ = Test.assertEqual(tag(), "@lam/ssh_composition", "dependent package owns collision-free tag")
+    checked: Result = checkGeneratedKey()
+    _ = Test.assertTrue(checked.ok(), "scoped dependency composition completes")
+    _summary: int = Test.summary()
+}

@@ -1,0 +1,307 @@
+# Test-only loopback SSH server and echo endpoint. Client assertions import only
+# @lam/ssh's public API; this fixture supplies deterministic local transport.
+
+from lamcrypto import Crypto, CryptoKeyPair
+
+go! {
+    import (
+        "bytes"
+        "errors"
+        "fmt"
+        "io"
+        "net"
+        "os"
+        "os/exec"
+        "strconv"
+        "sync"
+        "time"
+
+        gossh "golang.org/x/crypto/ssh"
+        "golang.org/x/crypto/ssh/knownhosts"
+    )
+
+    type lamLoopbackSshState struct {
+        Mu           sync.Mutex
+        SshListener  net.Listener
+        EchoListener net.Listener
+        Connections  map[net.Conn]struct{}
+        Wait         sync.WaitGroup
+        Closed       bool
+    }
+
+    func lamLoopbackTrack(state *lamLoopbackSshState, conn net.Conn) {
+        state.Mu.Lock()
+        if state.Closed {
+            state.Mu.Unlock()
+            conn.Close()
+            return
+        }
+        state.Connections[conn] = struct{}{}
+        state.Mu.Unlock()
+    }
+
+    func lamLoopbackUntrack(state *lamLoopbackSshState, conn net.Conn) {
+        state.Mu.Lock()
+        delete(state.Connections, conn)
+        state.Mu.Unlock()
+    }
+
+    func lamLoopbackEchoAccept(state *lamLoopbackSshState) {
+        defer state.Wait.Done()
+        for {
+            conn, err := state.EchoListener.Accept()
+            if err != nil {
+                return
+            }
+            lamLoopbackTrack(state, conn)
+            state.Wait.Add(1)
+            go func() {
+                defer state.Wait.Done()
+                defer conn.Close()
+                defer lamLoopbackUntrack(state, conn)
+                _, _ = io.Copy(conn, conn)
+            }()
+        }
+    }
+
+    func lamLoopbackExitStatus(err error) uint32 {
+        if err == nil {
+            return 0
+        }
+        var exitError *exec.ExitError
+        if errors.As(err, &exitError) {
+            return uint32(exitError.ExitCode())
+        }
+        return 255
+    }
+
+    func lamLoopbackSession(channel gossh.Channel, requests <-chan *gossh.Request) {
+        defer channel.Close()
+        environment := []string{}
+        var command *exec.Cmd
+        var commandMu sync.Mutex
+
+        for request := range requests {
+            switch request.Type {
+            case "env":
+                var payload struct {
+                    Name  string
+                    Value string
+                }
+                if err := gossh.Unmarshal(request.Payload, &payload); err != nil || payload.Name == "" {
+                    request.Reply(false, nil)
+                    continue
+                }
+                environment = append(environment, payload.Name+"="+payload.Value)
+                request.Reply(true, nil)
+            case "exec":
+                commandMu.Lock()
+                alreadyStarted := command != nil
+                commandMu.Unlock()
+                if alreadyStarted {
+                    request.Reply(false, nil)
+                    continue
+                }
+                var payload struct{ Command string }
+                if err := gossh.Unmarshal(request.Payload, &payload); err != nil {
+                    request.Reply(false, nil)
+                    continue
+                }
+                cmd := exec.Command("sh", "-c", payload.Command)
+                cmd.Env = append(os.Environ(), environment...)
+                cmd.Stdin = channel
+                cmd.Stdout = channel
+                cmd.Stderr = channel.Stderr()
+                commandMu.Lock()
+                command = cmd
+                commandMu.Unlock()
+                if err := cmd.Start(); err != nil {
+                    request.Reply(false, nil)
+                    return
+                }
+                request.Reply(true, nil)
+                go func() {
+                    err := cmd.Wait()
+                    status := lamLoopbackExitStatus(err)
+                    _, _ = channel.SendRequest("exit-status", false, gossh.Marshal(struct{ Status uint32 }{status}))
+                    channel.Close()
+                }()
+            case "signal":
+                request.Reply(true, nil)
+                commandMu.Lock()
+                if command != nil && command.Process != nil {
+                    _ = command.Process.Kill()
+                }
+                commandMu.Unlock()
+            default:
+                request.Reply(false, nil)
+            }
+        }
+        commandMu.Lock()
+        if command != nil && command.Process != nil {
+            _ = command.Process.Kill()
+        }
+        commandMu.Unlock()
+    }
+
+    func lamLoopbackForward(channel gossh.Channel, requests <-chan *gossh.Request, payload []byte) {
+        defer channel.Close()
+        go gossh.DiscardRequests(requests)
+        var direct struct {
+            DestAddr   string
+            DestPort   uint32
+            OriginAddr string
+            OriginPort uint32
+        }
+        if err := gossh.Unmarshal(payload, &direct); err != nil {
+            return
+        }
+        if direct.DestAddr != "127.0.0.1" && direct.DestAddr != "localhost" && direct.DestAddr != "::1" {
+            return
+        }
+        target := net.JoinHostPort(direct.DestAddr, strconv.Itoa(int(direct.DestPort)))
+        conn, err := net.DialTimeout("tcp", target, time.Second)
+        if err != nil {
+            return
+        }
+        defer conn.Close()
+
+        done := make(chan struct{}, 2)
+        go func() { _, _ = io.Copy(conn, channel); done <- struct{}{} }()
+        go func() { _, _ = io.Copy(channel, conn); done <- struct{}{} }()
+        <-done
+    }
+
+    func lamLoopbackChannels(channels <-chan gossh.NewChannel) {
+        for newChannel := range channels {
+            switch newChannel.ChannelType() {
+            case "session":
+                channel, requests, err := newChannel.Accept()
+                if err != nil {
+                    continue
+                }
+                go lamLoopbackSession(channel, requests)
+            case "direct-tcpip":
+                payload := append([]byte(nil), newChannel.ExtraData()...)
+                channel, requests, err := newChannel.Accept()
+                if err != nil {
+                    continue
+                }
+                go lamLoopbackForward(channel, requests, payload)
+            default:
+                _ = newChannel.Reject(gossh.UnknownChannelType, "unsupported channel")
+            }
+        }
+    }
+
+    func lamLoopbackSshAccept(state *lamLoopbackSshState, config *gossh.ServerConfig) {
+        defer state.Wait.Done()
+        for {
+            rawConn, err := state.SshListener.Accept()
+            if err != nil {
+                return
+            }
+            lamLoopbackTrack(state, rawConn)
+            state.Wait.Add(1)
+            go func() {
+                defer state.Wait.Done()
+                defer rawConn.Close()
+                defer lamLoopbackUntrack(state, rawConn)
+                serverConn, channels, requests, err := gossh.NewServerConn(rawConn, config)
+                if err != nil {
+                    return
+                }
+                defer serverConn.Close()
+                go gossh.DiscardRequests(requests)
+                lamLoopbackChannels(channels)
+            }()
+        }
+    }
+}
+
+class LoopbackSshServer {
+    func __init__(self, port: int, echoPort: int, fingerprint: str, knownHostsEntry: str, raw: any) {
+        self.port: int = port
+        self.echoPort: int = echoPort
+        self.fingerprint: str = fingerprint
+        self.knownHostsEntry: str = knownHostsEntry
+        self.raw: any = raw
+    }
+
+    static func start(username: str = "tester", password: str = "loopback-secret", authorizedKey: str = "") -> LoopbackSshServer {
+        hostKeys: CryptoKeyPair = Crypto.generateEd25519KeyPair()
+        go! {
+            hostSigner, err := gossh.ParsePrivateKey([]byte(hostKeys.PrivateKey))
+            if err != nil {
+                panic(err)
+            }
+
+            serverConfig := &gossh.ServerConfig{
+                PasswordCallback: func(metadata gossh.ConnMetadata, supplied []byte) (*gossh.Permissions, error) {
+                    if metadata.User() == username && string(supplied) == password {
+                        return nil, nil
+                    }
+                    return nil, fmt.Errorf("authentication rejected")
+                },
+            }
+            if authorizedKey != "" {
+                accepted, _, _, _, parseErr := gossh.ParseAuthorizedKey([]byte(authorizedKey))
+                if parseErr != nil {
+                    panic(parseErr)
+                }
+                serverConfig.PublicKeyCallback = func(metadata gossh.ConnMetadata, supplied gossh.PublicKey) (*gossh.Permissions, error) {
+                    if metadata.User() == username && bytes.Equal(accepted.Marshal(), supplied.Marshal()) {
+                        return nil, nil
+                    }
+                    return nil, fmt.Errorf("authentication rejected")
+                }
+            }
+            serverConfig.AddHostKey(hostSigner)
+
+            sshListener, err := net.Listen("tcp", "127.0.0.1:0")
+            if err != nil {
+                panic(err)
+            }
+            echoListener, err := net.Listen("tcp", "127.0.0.1:0")
+            if err != nil {
+                sshListener.Close()
+                panic(err)
+            }
+            state := &lamLoopbackSshState{
+                SshListener:  sshListener,
+                EchoListener: echoListener,
+                Connections:  make(map[net.Conn]struct{}),
+            }
+            state.Wait.Add(2)
+            go lamLoopbackSshAccept(state, serverConfig)
+            go lamLoopbackEchoAccept(state)
+
+            sshPort := sshListener.Addr().(*net.TCPAddr).Port
+            echoPort := echoListener.Addr().(*net.TCPAddr).Port
+            knownHostsEntry := knownhosts.Line([]string{fmt.Sprintf("[127.0.0.1]:%d", sshPort)}, hostSigner.PublicKey())
+            return NewLoopbackSshServer(sshPort, echoPort, gossh.FingerprintSHA256(hostSigner.PublicKey()), knownHostsEntry, state)
+        }
+    }
+
+    func close(self) {
+        go! {
+            state, ok := s.Raw.(*lamLoopbackSshState)
+            if !ok || state == nil {
+                return
+            }
+            state.Mu.Lock()
+            if state.Closed {
+                state.Mu.Unlock()
+                return
+            }
+            state.Closed = true
+            state.SshListener.Close()
+            state.EchoListener.Close()
+            for conn := range state.Connections {
+                conn.Close()
+            }
+            state.Mu.Unlock()
+            state.Wait.Wait()
+        }
+    }
+}
