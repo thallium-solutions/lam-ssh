@@ -2,6 +2,21 @@
 
 All notable changes to `@lam/ssh` are documented here.
 
+## [2.0.0] - 2026-09-30
+
+### Changed
+
+- Replaced public `try*`/throwing operation pairs with one unsuffixed `Result` API: `connect`, `close`, `run`, `runContext`, `openSession`, `dial`, `dialTcp`, `send`, and `receive`.
+- Migrated class constructors from `__init__` to `init` and updated flat, scoped, and historical nested compatibility coverage.
+- Updated Lam standard-library composition to the unsuffixed `Os.readFile` and `Crypto.generateEd25519KeyPair` APIs and propagated fallible `Context.expirable` results.
+- Raised compiler compatibility to `lamc ^1.18` and bumped the breaking package major to 2.
+- Removed avoidable `go!` result-unwrapping bridges while retaining native blocks at the SSH, key-conversion, context, and `net.Conn` boundaries.
+
+### Testing
+
+- Added installed-package loopback composition coverage for encrypted keys,
+  sessions, command failures, cancellation, TCP forwarding, and closed states.
+
 ## [1.0.0] - 2026-09-13
 
 ### Added
@@ -24,4 +39,5 @@ All notable changes to `@lam/ssh` are documented here.
 - Offline key/config tests, scoped-package composition coverage, and a loopback SSH integration suite covering password/key authentication, host verification, sessions, cancellation, commands, and forwarding.
 - `lamc` 1.16.x test runner, package scripts, documentation, and Apache-2.0 licensing.
 
+[2.0.0]: https://github.com/thallium-solutions/lam-ssh/releases/tag/v2.0.0
 [1.0.0]: https://github.com/thallium-solutions/lam-ssh/releases/tag/v1.0.0

@@ -2,7 +2,7 @@
 
 A typed, production-minded SSH client package for [Lammergeier](https://github.com/thallium-solutions/lammergeier-lang), backed by `golang.org/x/crypto/ssh` v0.55.0.
 
-`@lam/ssh` provides password and Ed25519 private-key authentication, strict host-key verification, separate stdout/stderr command results, cancellation-aware execution, reusable session templates, Ed25519 key utilities, and typed `direct-tcpip` connections. It composes with the `lamcrypto` and `lamcontext` standard-library modules and targets `lamc` 1.16.x.
+`@lam/ssh` provides password and Ed25519 private-key authentication, strict host-key verification, separate stdout/stderr command results, cancellation-aware execution, reusable session templates, Ed25519 key utilities, and typed `direct-tcpip` connections. It composes with the `lamcrypto` and `lamcontext` standard-library modules and targets `lamc` 1.18.x.
 
 ## Installation
 
@@ -23,7 +23,7 @@ Use `lamc install` when testing the canonical scoped `from @lam/ssh import ...` 
 ### Git
 
 ```bash
-lamc install https://github.com/thallium-solutions/lam-ssh.git@v1.0.0
+lamc install https://github.com/thallium-solutions/lam-ssh.git@v2.0.0
 ```
 
 Pin a tag or commit in reproducible projects rather than tracking a branch.
@@ -31,7 +31,7 @@ Pin a tag or commit in reproducible projects rather than tracking a branch.
 ### Registry
 
 ```bash
-lamc install @lam/ssh@^1.0.0
+lamc install @lam/ssh@^2.0.0
 ```
 
 The scoped package root exports the public API. The generated `ssh.lam` shim remains available for local flat-module development and retains its scaffolded `tag()` smoke test. Import the canonical package with:
@@ -67,26 +67,28 @@ Root implementation modules use package-relative imports such as `from .ssh_conf
 Host verification is strict by default. A config is invalid until it has a `known_hosts` file, a SHA256 host-key fingerprint, or an explicit insecure opt-out.
 
 ```lammergeier
+from lamerrors import Result
 from @lam/ssh import SshConfig, SshClient, SshCommandResult
 
-func main() {
+func inspectHost() -> Result {
     config: SshConfig = SshConfig("ssh.example.com", "deploy", 22)
     config.withPassword("read-this-from-a-secret-store")
     config.withHostKeyFingerprint("SHA256:REPLACE_WITH_THE_VERIFIED_FINGERPRINT")
     config.withTimeouts(5000, 5000, 30000)
     config.withEnv("LANG", "C")
 
-    client: SshClient = SshClient.connect(config)
-    result: SshCommandResult = client.run("uname -a")
+    client: SshClient = SshClient.connect(config)?
+    result: SshCommandResult = client.run("uname -a")?
     print(result.stdout)
     if not result.success {
         print(f"remote command exited {result.exitCode}")
     }
-    client.close()
+    _ = client.close()?
+    return Result.Ok(None)
 }
 ```
 
-A nonzero remote exit status is still a successful SSH operation: `tryRun` returns `Result.Ok(SshCommandResult)` with `success == False`. Connection, protocol, cancellation, and missing-exit-status failures return `Result.Err`.
+A nonzero remote exit status is still a successful SSH operation: `run` returns `Result.Ok(SshCommandResult)` with `success == False`. Connection, protocol, cancellation, and missing-exit-status failures return `Result.Err`.
 
 ## Private-key authentication
 
@@ -106,9 +108,9 @@ func deploy() -> Result {
     config.withPrivateKey(pair.privateKeyPem, "optional-key-passphrase")
     config.withKnownHosts("/home/deploy/.ssh/known_hosts")
 
-    client: SshClient = SshClient.tryConnect(config)?
-    result: SshCommandResult = client.tryRun("id")?
-    client.close()
+    client: SshClient = SshClient.connect(config)?
+    result: SshCommandResult = client.run("id")?
+    _ = client.close()?
     return Result.Ok(result)
 }
 ```
@@ -122,7 +124,7 @@ print(pair.authorizedPublicKey())
 print(pair.sha256Fingerprint())
 ```
 
-Secure Ed25519 generation comes from `Crypto.tryGenerateEd25519KeyPair()` and its portable `CryptoKeyPair`. `@lam/ssh` only converts that key into OpenSSH private-key, authorized-key, and fingerprint forms through `x/crypto/ssh`; passphrases still produce encrypted OpenSSH private keys.
+Secure Ed25519 generation comes from `Crypto.generateEd25519KeyPair()` and its portable `CryptoKeyPair`. `@lam/ssh` only converts that key into OpenSSH private-key, authorized-key, and fingerprint forms through `x/crypto/ssh`; passphrases still produce encrypted OpenSSH private keys.
 
 `privateKeyPem` is sensitive. Write private keys only to a securely permissioned destination (normally mode `0600`), and never print a key pair or populated config.
 
@@ -147,7 +149,7 @@ Do not use that setting in production. It permits machine-in-the-middle attacks.
 
 ## Context cancellation and expiration
 
-Normal `run`/`tryRun` derives a standard-library expirable `Context` from `config.commandTimeoutMs` (`0` disables that timeout). For caller-controlled cancellation, pass `lamcontext.Context` directly; it is re-exported by `@lam/ssh`:
+`run` derives a standard-library expirable `Context` from `config.commandTimeoutMs` (`0` disables that timeout). For caller-controlled cancellation, pass `lamcontext.Context` directly; it is re-exported by `@lam/ssh`:
 
 ```lammergeier
 from lamerrors import Result
@@ -155,12 +157,13 @@ from @lam/ssh import Context, SshClient, SshCommandResult
 
 func bounded(client: SshClient) -> Result {
     root: Context = Context.simple()
-    requestContext: Context = root.expirable(2, "seconds")
-    result: Result[SshCommandResult] = client.tryRunContext(
+    requestContext: Context = root.expirable(2, "seconds")?
+    result: Result[SshCommandResult] = client.runContext(
         requestContext,
         "long-running-command",
     )
-    print(requestContext.expiresIn("milliseconds"))
+    remainingMs: int = requestContext.expiresIn("milliseconds")?
+    print(remainingMs)
     print(requestContext.expired())
     requestContext.cancel("request complete")
     return result
@@ -169,19 +172,19 @@ func bounded(client: SshClient) -> Result {
 
 The SSH boundary calls `Context.native()` to obtain the underlying Go `context.Context`. Cancellation closes the native SSH session and waits for its command waiter to finish, preventing abandoned session goroutines while preserving stdlib expiration, cancellation reasons, and parent/child propagation.
 
-`SshContext.simple()`, `SshContext.cancellable()`, `SshContext.expirable(expiration, unit)`, and `SshContext.cancelled(reason)` are stateless convenience constructors. They return `Context` values and own no separate context state; new code may use `Context` directly.
+`SshContext.simple()`, `SshContext.cancellable()`, and `SshContext.cancelled(reason)` are stateless convenience constructors returning `Context`; `SshContext.expirable(expiration, unit)` returns `Result[Context]`. The facade owns no separate context state, and new code may use `Context` directly.
 
 ## Reusable sessions
 
 `SshSession` is a reusable command template. Every run opens a fresh native Go SSH session while preserving the template's environment and stdin settings.
 
 ```lammergeier
-session = client.openSession()
+session: SshSession = client.openSession()?
 session.env("APP_ENV", "production").stdin("input\n")
-first = session.run("read value; printf '%s:%s' \"$APP_ENV\" \"$value\"")
+first: SshCommandResult = session.run("read value; printf '%s:%s' \"$APP_ENV\" \"$value\"")?
 
 session.clearStdin()
-second = session.run("printf '%s' \"$APP_ENV\"")
+second: SshCommandResult = session.run("printf '%s' \"$APP_ENV\"")?
 session.close()
 ```
 
@@ -192,18 +195,18 @@ Closing a session template does not close its parent client. Reuse is intended f
 For database clients and other protocols that can consume a stream, `direct-tcpip` is exposed as a typed connection:
 
 ```lammergeier
-connection = client.dialTcp("127.0.0.1", 5432)
-connection.send("protocol bytes")
-reply = connection.recv(4096)
-connection.close()
+connection: SshTcpConn = client.dialTcp("127.0.0.1", 5432)?
+written: int = connection.send("protocol bytes")?
+reply: str = connection.receive(4096)?
+_ = connection.close()?
 ```
 
-Only `tcp`, `tcp4`, and `tcp6` are accepted by `tryDial`. Reads are bounded (maximum 16 MiB per call), close is idempotent, and failures use `Result`. SSH channel connections may report that deadlines are unsupported; `setDeadline` returns that as `Result.Err` rather than hiding it.
+Only `tcp`, `tcp4`, and `tcp6` are accepted by `dial`. Reads are bounded (maximum 16 MiB per call), close is idempotent, and failures use `Result`. SSH channel connections may report that deadlines are unsupported; `setDeadline` returns that as `Result.Err` rather than hiding it.
 
 ## API overview
 
 - `SshConfig`: fluent password/private-key, port, timeout, environment, `known_hosts`, fingerprint, and explicit insecure settings; `validate()` returns `Result[SshConfig]`.
-- `SshClient`: `connect`/`tryConnect`, `connected`, `close`/`tryClose`, `run`/`tryRun`, context variants, reusable sessions, and typed TCP dialing.
+- `SshClient`: `Result`-returning `connect`, `close`, `run`, `runContext`, `openSession`, `dial`, and `dialTcp` operations plus the `connected` state query.
 - `SshCommandResult`: `stdout`, `stderr`, `exitCode`, and `success`.
 - `SshSession`: `env`, `stdin`, timeout, run/context variants, clear, state, and close APIs.
 - `SshKey` / `SshKeyPair`: `lamcrypto`-backed Ed25519 generation, OpenSSH parsing/conversion, authorized-key derivation, SHA256 fingerprints, and public/private key-file readers.
@@ -223,7 +226,7 @@ Only `tcp`, `tcp4`, and `tcp6` are accepted by `tryDial`. Reads are bounded (max
 
 ## Development
 
-Tests are entirely offline or bind only to loopback. The runner requires `lamc` 1.16.x and separately exercises the canonical package with one ordinary extlibs root, the flat shim, nested compatibility modules, and a generated scoped dependent with its own `config.lam` and `tag()`:
+Tests are entirely offline or bind only to loopback. The runner requires `lamc` 1.18.x and separately exercises the canonical package with one ordinary extlibs root, the flat shim, nested compatibility modules, and a generated scoped dependent with its own `config.lam` and `tag()`:
 
 ```bash
 python3 tests/run_tests.py
@@ -233,4 +236,4 @@ lamc lib run test
 
 Format checks are available through `lamc lib run check`.
 
-The package composes directly with Lammergeier 1.16's `lamcrypto.Crypto` / `CryptoKeyPair` for secure Ed25519 generation and `lamcontext.Context` for cancellation trees, unit-aware expiration, reasons, and native Go interop. `go!` remains confined to the unavoidable `x/crypto/ssh`, `net.Conn`, stream, OpenSSH conversion, and `Context.native()` boundaries; fallible APIs use `lamerrors`, and file reads use `lamos`.
+The package composes directly with Lammergeier 1.18's `lamcrypto.Crypto` / `CryptoKeyPair` for secure Ed25519 generation and `lamcontext.Context` for cancellation trees, unit-aware expiration, reasons, and native Go interop. `go!` remains confined to the unavoidable `x/crypto/ssh`, `net.Conn`, stream, OpenSSH conversion, and `Context.native()` boundaries; fallible APIs use `lamerrors`, and file reads use `lamos`.

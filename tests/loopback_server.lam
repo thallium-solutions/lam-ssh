@@ -2,6 +2,7 @@
 # @lam/ssh's public API; this fixture supplies deterministic local transport.
 
 from lamcrypto import Crypto, CryptoKeyPair
+from lamerrors import Result
 
 go! {
     import (
@@ -220,7 +221,7 @@ go! {
 }
 
 class LoopbackSshServer {
-    func __init__(self, port: int, echoPort: int, fingerprint: str, knownHostsEntry: str, raw: any) {
+    func init(self, port: int, echoPort: int, fingerprint: str, knownHostsEntry: str, raw: any) {
         self.port: int = port
         self.echoPort: int = echoPort
         self.fingerprint: str = fingerprint
@@ -228,12 +229,12 @@ class LoopbackSshServer {
         self.raw: any = raw
     }
 
-    static func start(username: str = "tester", password: str = "loopback-secret", authorizedKey: str = "") -> LoopbackSshServer {
-        hostKeys: CryptoKeyPair = Crypto.generateEd25519KeyPair()
+    static func start(username: str = "tester", password: str = "loopback-secret", authorizedKey: str = "") -> Result[LoopbackSshServer] {
+        hostKeys: CryptoKeyPair = Crypto.generateEd25519KeyPair()?
         go! {
             hostSigner, err := gossh.ParsePrivateKey([]byte(hostKeys.PrivateKey))
             if err != nil {
-                panic(err)
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("LoopbackSshServerError", "could not parse generated host key: "+err.Error(), nil))
             }
 
             serverConfig := &gossh.ServerConfig{
@@ -247,7 +248,7 @@ class LoopbackSshServer {
             if authorizedKey != "" {
                 accepted, _, _, _, parseErr := gossh.ParseAuthorizedKey([]byte(authorizedKey))
                 if parseErr != nil {
-                    panic(parseErr)
+                    return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("LoopbackSshServerError", "could not parse authorized key: "+parseErr.Error(), nil))
                 }
                 serverConfig.PublicKeyCallback = func(metadata gossh.ConnMetadata, supplied gossh.PublicKey) (*gossh.Permissions, error) {
                     if metadata.User() == username && bytes.Equal(accepted.Marshal(), supplied.Marshal()) {
@@ -260,12 +261,12 @@ class LoopbackSshServer {
 
             sshListener, err := net.Listen("tcp", "127.0.0.1:0")
             if err != nil {
-                panic(err)
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("LoopbackSshServerError", "could not listen for SSH: "+err.Error(), nil))
             }
             echoListener, err := net.Listen("tcp", "127.0.0.1:0")
             if err != nil {
                 sshListener.Close()
-                panic(err)
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("LoopbackSshServerError", "could not listen for echo traffic: "+err.Error(), nil))
             }
             state := &lamLoopbackSshState{
                 SshListener:  sshListener,
@@ -279,7 +280,7 @@ class LoopbackSshServer {
             sshPort := sshListener.Addr().(*net.TCPAddr).Port
             echoPort := echoListener.Addr().(*net.TCPAddr).Port
             knownHostsEntry := knownhosts.Line([]string{fmt.Sprintf("[127.0.0.1]:%d", sshPort)}, hostSigner.PublicKey())
-            return NewLoopbackSshServer(sshPort, echoPort, gossh.FingerprintSHA256(hostSigner.PublicKey()), knownHostsEntry, state)
+            return LAMMERGEIER.Result.Ok(NewLoopbackSshServer(sshPort, echoPort, gossh.FingerprintSHA256(hostSigner.PublicKey()), knownHostsEntry, state))
         }
     }
 

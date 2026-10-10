@@ -20,7 +20,7 @@ func sshValidEnvironmentName(name: str) -> bool {
 # Host-key verification is mandatory unless the explicit insecure opt-out is
 # enabled. Never print or serialize a populated config.
 class SshConfig {
-    func __init__(self, host: str, username: str, port: int = 22) {
+    func init(self, host: str, username: str, port: int = 22) {
         self.host: str = host
         self.username: str = username
         self.port: int = port

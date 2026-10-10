@@ -44,7 +44,7 @@ go! {
 
 # Parsed public SSH key material with authorized_keys and SHA256 forms.
 class SshKey {
-    func __init__(self, keyType: str, authorizedKey: str, fingerprint: str, comment: str = "") {
+    func init(self, keyType: str, authorizedKey: str, fingerprint: str, comment: str = "") {
         self.keyType: str = keyType
         self.authorizedKey: str = authorizedKey
         self.fingerprint: str = fingerprint
@@ -72,11 +72,11 @@ class SshKey {
         if path.trim() == "" {
             return Result.Err(Error("SshKeyFileError", "public-key path must not be empty", None))
         }
-        loaded: Result[str] = Os.tryReadFile(path)
+        loaded: Result[str] = Os.readFile(path)
         if not loaded.ok() {
             return Result.Err(Error("SshKeyFileError", "could not read public-key file", loaded.error))
         }
-        content: str = str(loaded.unwrap())
+        content: str = loaded?
         return SshKey.fromAuthorizedKey(content)
     }
 
@@ -96,14 +96,14 @@ class SshKey {
 # Private OpenSSH key plus its derived public key. Treat privateKeyPem as a
 # secret and do not log or serialize this object.
 class SshKeyPair {
-    func __init__(self, privateKeyPem: str, publicKey: SshKey, encrypted: bool = false) {
+    func init(self, privateKeyPem: str, publicKey: SshKey, encrypted: bool = false) {
         self.privateKeyPem: str = privateKeyPem
         self.publicKey: SshKey = publicKey
         self.encrypted: bool = encrypted
     }
 
     static func generateEd25519(comment: str = "", passphrase: str = "") -> Result[SshKeyPair] {
-        generated: Result = Crypto.tryGenerateEd25519KeyPair()
+        generated: Result = Crypto.generateEd25519KeyPair()
         if not generated.ok() {
             return Result.Err(Error("SshKeyGenerationError", "lamcrypto could not generate an Ed25519 key pair", generated.error))
         }
@@ -159,11 +159,11 @@ class SshKeyPair {
         if path.trim() == "" {
             return Result.Err(Error("SshKeyFileError", "private-key path must not be empty", None))
         }
-        loaded: Result[str] = Os.tryReadFile(path)
+        loaded: Result[str] = Os.readFile(path)
         if not loaded.ok() {
             return Result.Err(Error("SshKeyFileError", "could not read private-key file", loaded.error))
         }
-        privateKeyPem: str = str(loaded.unwrap())
+        privateKeyPem: str = loaded?
         return SshKeyPair.fromPrivateKey(privateKeyPem, passphrase, comment)
     }
 

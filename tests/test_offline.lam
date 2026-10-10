@@ -6,7 +6,7 @@ from lamtest import Test
 from @lam/ssh import SshConfig, Context, SshContext, SshKey, SshKeyPair
 
 func checkKeys() -> Result {
-    cryptoPair: CryptoKeyPair = Crypto.tryGenerateEd25519KeyPair()?
+    cryptoPair: CryptoKeyPair = Crypto.generateEd25519KeyPair()?
     _ = Test.assertTrue(cryptoPair.algorithm == "Ed25519" and cryptoPair.bits == 256, "lamcrypto Ed25519 source metadata")
     _ = Test.assertTrue(cryptoPair.privateKey.startsWith("-----BEGIN PRIVATE KEY-----"), "lamcrypto Ed25519 source PEM")
 
@@ -30,6 +30,27 @@ func checkKeys() -> Result {
     _ = Test.assertFalse(SshKeyPair.fromPrivateKey(encrypted.privateKeyPem, "wrong").ok(), "wrong key passphrase is rejected")
     unlocked: SshKeyPair = SshKeyPair.fromPrivateKey(encrypted.privateKeyPem, "test-passphrase")?
     _ = Test.assertEqual(unlocked.sha256Fingerprint(), encrypted.sha256Fingerprint(), "encrypted private-key parse")
+    return Result.Ok(None)
+}
+
+func checkContexts() -> Result {
+    context: Context = Context.simple().cancellable()
+    _ = Test.assertFalse(context.expired(), "stdlib Context starts active")
+    _ = Test.assertNotNil(context.native(), "Context.native exposes the SSH Go boundary")
+    context.cancel("offline cancellation")
+    _ = Test.assertTrue(context.expired(), "stdlib Context cancellation is observed")
+    _ = Test.assertEqual(context.reason(), "offline cancellation", "stdlib Context reason is retained")
+
+    timeout: Context = Context.simple().expirable(5, "milliseconds")?
+    _ = Test.assertTrue(timeout.wait(100), "stdlib Context expiration completes")
+    _ = Test.assertTrue(timeout.expired(), "stdlib Context reports expiration")
+    timeout.cancel("cleanup")
+
+    compatibility: Context = SshContext.cancellable()
+    _ = Test.assertFalse(compatibility.expired(), "SshContext facade returns Context")
+    compatibility.cancel("cleanup")
+    compatibilityTimeout: Context = SshContext.expirable(5, "milliseconds")?
+    compatibilityTimeout.cancel("cleanup")
     return Result.Ok(None)
 }
 
@@ -69,21 +90,8 @@ func main() {
     invalidEnvironment.insecureSkipHostKeyVerification(True).withEnv("BAD=NAME", "value")
     _ = Test.assertFalse(invalidEnvironment.validate().ok(), "invalid environment name is rejected")
 
-    context: Context = Context.simple().cancellable()
-    _ = Test.assertFalse(context.expired(), "stdlib Context starts active")
-    _ = Test.assertNotNil(context.native(), "Context.native exposes the SSH Go boundary")
-    context.cancel("offline cancellation")
-    _ = Test.assertTrue(context.expired(), "stdlib Context cancellation is observed")
-    _ = Test.assertEqual(context.reason(), "offline cancellation", "stdlib Context reason is retained")
-
-    timeout: Context = Context.simple().expirable(5, "milliseconds")
-    _ = Test.assertTrue(timeout.wait(100), "stdlib Context expiration completes")
-    _ = Test.assertTrue(timeout.expired(), "stdlib Context reports expiration")
-    timeout.cancel("cleanup")
-
-    compatibility: Context = SshContext.cancellable()
-    _ = Test.assertFalse(compatibility.expired(), "SshContext facade returns Context")
-    compatibility.cancel("cleanup")
+    contextChecks: Result = checkContexts()
+    _ = Test.assertTrue(contextChecks.ok(), "stdlib Context checks complete")
 
     keyChecks: Result = checkKeys()
     _ = Test.assertTrue(keyChecks.ok(), "offline key checks complete")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile and run every consumer-style Lam test with lamc 1.16.x."""
+"""Compile and run every consumer-style Lam test with lamc 1.18.x."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 TESTS = pathlib.Path(__file__).resolve().parent
-REQUIRED_MAJOR_MINOR = (1, 16)
+REQUIRED_MAJOR_MINOR = (1, 18)
 VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?$")
 
 
@@ -41,7 +41,7 @@ def require_lamc() -> str:
     major_minor = (int(match.group(1)), int(match.group(2)))
     if major_minor != REQUIRED_MAJOR_MINOR:
         raise SystemExit(
-            f"error: @lam/ssh tests require lamc 1.16.x; found {version}"
+            f"error: @lam/ssh tests require lamc 1.18.x; found {version}"
         )
     return lamc
 
@@ -52,7 +52,7 @@ def write_composition_fixture(extlibs: pathlib.Path) -> None:
     package.mkdir(parents=True)
     (package / "config.lam").write_text(
         """class CompositionConfig {
-    func __init__(self, name: str = "sftp-shape") {
+    func init(self, name: str = "sftp-shape") {
         self.name: str = name
     }
 }

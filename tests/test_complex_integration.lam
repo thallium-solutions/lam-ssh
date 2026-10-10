@@ -1,0 +1,103 @@
+# Composed end-to-end coverage for the v2 Result API over loopback only.
+
+from lamerrors import Result
+from lamtest import Test
+from @lam/ssh import Context, SshClient, SshCommandResult, SshConfig, SshKey, SshKeyPair, SshSession, SshTcpConn
+from loopback_server import LoopbackSshServer
+
+func runComplexIntegration() -> Result {
+    pair: SshKeyPair = SshKeyPair.generateEd25519("complex-integration", "key-passphrase")?
+    _ = Test.assertTrue(pair.encrypted, "generated integration key is encrypted")
+
+    parsedPair: SshKeyPair = SshKeyPair.fromPrivateKey(pair.privateKeyPem, "key-passphrase", "parsed-comment")?
+    _ = Test.assertEqual(parsedPair.sha256Fingerprint(), pair.sha256Fingerprint(), "encrypted private-key parsing preserves identity")
+    _ = Test.assertFalse(SshKeyPair.fromPrivateKey(pair.privateKeyPem, "incorrect-passphrase").ok(), "encrypted key rejects an incorrect passphrase")
+
+    parsedPublic: SshKey = SshKey.fromAuthorizedKey(pair.authorizedPublicKey() + "\n")?
+    _ = Test.assertTrue(parsedPublic.isEd25519(), "authorized-key parser retains Ed25519 type")
+    _ = Test.assertEqual(parsedPublic.sha256Fingerprint(), pair.sha256Fingerprint(), "authorized-key parser preserves key fingerprint")
+    _ = Test.assertEqual(parsedPublic.comment, "complex-integration", "authorized-key parser preserves key comment")
+    _ = Test.assertFalse(SshKey.fromAuthorizedKey(pair.authorizedPublicKey() + "\n" + pair.authorizedPublicKey()).ok(), "authorized-key parser rejects multiple keys")
+
+    server: LoopbackSshServer = LoopbackSshServer.start("result-user", "unused", pair.authorizedPublicKey())?
+    config: SshConfig = SshConfig("127.0.0.1", "result-user", server.port)
+    config.withPrivateKey(pair.privateKeyPem, "key-passphrase")
+    config.withHostKeyFingerprint(server.fingerprint)
+    config.withTimeouts(1000, 1000, 1000)
+    config.withEnv("LAM_COMPLEX_DEFAULT", "from-config")
+
+    connected: Result[SshClient] = SshClient.connect(config)
+    _ = Test.assertTrue(connected.ok(), "v2 connect returns Result.Ok for key-authenticated loopback")
+    client: SshClient = connected?
+    _ = Test.assertTrue(client.connected(), "connected client reports live state")
+
+    successfulResult: Result[SshCommandResult] = client.run("printf '%s' \"$LAM_COMPLEX_DEFAULT\"")
+    _ = Test.assertTrue(successfulResult.ok(), "v2 run returns Result.Ok for a completed command")
+    successful: SshCommandResult = successfulResult?
+    _ = Test.assertTrue(successful.success, "zero command result is successful")
+    _ = Test.assertEqual(successful.exitCode, 0, "zero command result retains exit status")
+    _ = Test.assertEqual(successful.stdout, "from-config", "client command receives configured environment")
+    _ = Test.assertEqual(successful.stderr, "", "successful command keeps stderr separate")
+
+    nonzeroResult: Result[SshCommandResult] = client.run("printf partial; printf diagnostic >&2; exit 23")
+    _ = Test.assertTrue(nonzeroResult.ok(), "nonzero exit remains a successful transport Result")
+    nonzero: SshCommandResult = nonzeroResult?
+    _ = Test.assertFalse(nonzero.success, "nonzero command result is marked unsuccessful")
+    _ = Test.assertEqual(nonzero.exitCode, 23, "nonzero command result preserves exit status")
+    _ = Test.assertEqual(nonzero.stdout, "partial", "nonzero command result preserves stdout")
+    _ = Test.assertEqual(nonzero.stderr, "diagnostic", "nonzero command result preserves stderr")
+    _ = Test.assertFalse(client.run("   ").ok(), "empty commands fail through Result.Err")
+
+    opened: Result[SshSession] = client.openSession()
+    _ = Test.assertTrue(opened.ok(), "session creation uses the v2 Result API")
+    session: SshSession = opened?
+    session.env("LAM_COMPLEX_SESSION", "session-env").stdin("first-input")
+    first: SshCommandResult = session.run("printf '%s:' \"$LAM_COMPLEX_SESSION\"; cat")?
+    _ = Test.assertEqual(first.stdout, "session-env:first-input", "session composes environment and stdin")
+
+    session.stdin("second-input")
+    second: SshCommandResult = session.run("cat")?
+    _ = Test.assertEqual(second.stdout, "second-input", "reused session applies updated stdin")
+    session.clearStdin().clearEnv()
+    cleared: SshCommandResult = session.run("printf '%s:%s' \"${LAM_COMPLEX_SESSION-unset}\" \"${LAM_COMPLEX_DEFAULT-unset}\"")?
+    _ = Test.assertEqual(cleared.stdout, "unset:unset", "reused session clears inherited and per-session environment")
+
+    cancelled: Context = Context.cancelled("composed cancellation")
+    _ = Test.assertFalse(client.runContext(cancelled, "printf unreachable").ok(), "pre-cancelled context returns Result.Err")
+    _ = Test.assertEqual(cancelled.reason(), "composed cancellation", "cancelled context retains its reason")
+
+    deadline: Context = Context.simple().expirable(25, "milliseconds")?
+    _ = Test.assertFalse(session.runContext(deadline, "sleep 1").ok(), "session command observes context deadline")
+    _ = Test.assertTrue(deadline.expired(), "deadline context becomes expired")
+    _ = Test.assertEqual(deadline.reason(), "deadline exceeded", "deadline reason survives SSH cancellation")
+    recovered: SshCommandResult = session.run("printf recovered")?
+    _ = Test.assertEqual(recovered.stdout, "recovered", "session remains reusable after a cancelled command")
+
+    _ = Test.assertFalse(client.dial("udp", "127.0.0.1:1").ok(), "tunnel rejects unsupported networks")
+    _ = Test.assertFalse(client.dialTcp("", server.echoPort).ok(), "typed TCP tunnel rejects an empty host")
+    tunneled: Result[SshTcpConn] = client.dialTcp("127.0.0.1", server.echoPort)
+    _ = Test.assertTrue(tunneled.ok(), "typed TCP tunnel opens through the SSH client")
+    tunnel: SshTcpConn = tunneled?
+    _ = Test.assertTrue(tunnel.localAddr() != "", "TCP tunnel exposes a local address")
+    _ = Test.assertTrue(tunnel.remoteAddr() != "", "TCP tunnel exposes a remote address")
+    _ = Test.assertEqual(tunnel.send("composed-tunnel")?, 15, "TCP tunnel reports complete write length")
+    _ = Test.assertEqual(tunnel.receive(64)?, "composed-tunnel", "TCP tunnel round-trips loopback payload")
+    _ = Test.assertTrue(tunnel.close().ok(), "TCP tunnel closes through Result.Ok")
+    _ = Test.assertTrue(tunnel.close().ok(), "TCP tunnel close is idempotent")
+    _ = Test.assertFalse(tunnel.receive(1).ok(), "closed TCP tunnel rejects reads")
+
+    session.close()
+    _ = Test.assertTrue(session.closed(), "session close records closed state")
+    _ = Test.assertFalse(session.run("printf unreachable").ok(), "closed session rejects reuse")
+    _ = Test.assertTrue(client.close().ok(), "client closes through Result.Ok")
+    _ = Test.assertFalse(client.connected(), "closed client reports disconnected state")
+    _ = Test.assertFalse(client.openSession().ok(), "closed client rejects new sessions")
+    server.close()
+    return Result.Ok(None)
+}
+
+func main() {
+    result: Result = runComplexIntegration()
+    _ = Test.assertTrue(result.ok(), "complex SSH integration completes")
+    _summary: int = Test.summary()
+}

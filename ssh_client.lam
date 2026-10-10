@@ -151,7 +151,7 @@ go! {
         return methods, nil
     }
 
-    func lamSshTryConnect(config *SshConfig, privateKeyMaterial string) *Result {
+    func lamSshConnect(config *SshConfig, privateKeyMaterial string) *Result {
         auth, err := lamSshAuthMethods(config, privateKeyMaterial)
         if err != nil {
             return lamSshClientResultError("SshAuthenticationConfigError", err.Error())
@@ -294,7 +294,7 @@ go! {
 }
 
 class SshCommandResult {
-    func __init__(self, stdout: str, stderr: str, exitCode: int, success: bool) {
+    func init(self, stdout: str, stderr: str, exitCode: int, success: bool) {
         self.stdout: str = stdout
         self.stderr: str = stderr
         self.exitCode: int = exitCode
@@ -303,12 +303,12 @@ class SshCommandResult {
 }
 
 class SshClient {
-    func __init__(self, config: SshConfig) {
+    func init(self, config: SshConfig) {
         self.config: SshConfig = config
         self.raw: any = None
     }
 
-    static func tryConnect(config: SshConfig) -> Result[SshClient] {
+    static func connect(config: SshConfig) -> Result[SshClient] {
         validation: Result[SshConfig] = config.validate()
         if not validation.ok() {
             return Result.Err(validation.error)
@@ -316,28 +316,14 @@ class SshClient {
 
         privateKeyMaterial: str = config.privateKeyPem
         if privateKeyMaterial == "" and config.privateKeyPath != "" {
-            loaded: Result[str] = Os.tryReadFile(config.privateKeyPath)
+            loaded: Result[str] = Os.readFile(config.privateKeyPath)
             if not loaded.ok() {
                 return Result.Err(Error("SshKeyFileError", "could not read configured private-key file", loaded.error))
             }
-            privateKeyMaterial = str(loaded.unwrap())
+            privateKeyMaterial = loaded?
         }
         go! {
-            return lamSshTryConnect(config, privateKeyMaterial)
-        }
-    }
-
-    static func connect(config: SshConfig) -> SshClient {
-        result: Result[SshClient] = SshClient.tryConnect(config)
-        if not result.ok() {
-            throw RuntimeError(str(result.error))
-        }
-        go! {
-            client, ok := result.Value.(*SshClient)
-            if !ok {
-                panic("@lam/ssh internal error: connect returned an invalid value")
-            }
-            return client
+            return lamSshConnect(config, privateKeyMaterial)
         }
     }
 
@@ -353,7 +339,7 @@ class SshClient {
         }
     }
 
-    func tryClose(self) -> Result {
+    func close(self) -> Result {
         go! {
             state, ok := s.Raw.(*lamSshClientState)
             if !ok || state == nil {
@@ -377,36 +363,15 @@ class SshClient {
         }
     }
 
-    func close(self) {
-        result: Result = self.tryClose()
-        if not result.ok() {
-            throw RuntimeError(str(result.error))
-        }
-    }
-
-    func tryRun(self, command: str) -> Result[SshCommandResult] {
+    func run(self, command: str) -> Result[SshCommandResult] {
         requestContext: Context = Context.simple()
         if self.config.commandTimeoutMs > 0 {
-            requestContext = requestContext.expirable(self.config.commandTimeoutMs, "milliseconds")
+            requestContext = requestContext.expirable(self.config.commandTimeoutMs, "milliseconds")?
         }
-        return self.tryRunContext(requestContext, command)
+        return self.runContext(requestContext, command)
     }
 
-    func run(self, command: str) -> SshCommandResult {
-        result: Result[SshCommandResult] = self.tryRun(command)
-        if not result.ok() {
-            throw RuntimeError(str(result.error))
-        }
-        go! {
-            commandResult, ok := result.Value.(*SshCommandResult)
-            if !ok {
-                panic("@lam/ssh internal error: command returned an invalid value")
-            }
-            return commandResult
-        }
-    }
-
-    func tryRunContext(self, requestContext: Context, command: str) -> Result[SshCommandResult] {
+    func runContext(self, requestContext: Context, command: str) -> Result[SshCommandResult] {
         go! {
             state, ok := s.Raw.(*lamSshClientState)
             if !ok {
@@ -420,21 +385,7 @@ class SshClient {
         }
     }
 
-    func runContext(self, requestContext: Context, command: str) -> SshCommandResult {
-        result: Result[SshCommandResult] = self.tryRunContext(requestContext, command)
-        if not result.ok() {
-            throw RuntimeError(str(result.error))
-        }
-        go! {
-            commandResult, ok := result.Value.(*SshCommandResult)
-            if !ok {
-                panic("@lam/ssh internal error: command returned an invalid value")
-            }
-            return commandResult
-        }
-    }
-
-    func tryOpenSession(self) -> Result[SshSession] {
+    func openSession(self) -> Result[SshSession] {
         go! {
             clientState, ok := s.Raw.(*lamSshClientState)
             if !ok {
@@ -453,21 +404,7 @@ class SshClient {
         }
     }
 
-    func openSession(self) -> SshSession {
-        result: Result[SshSession] = self.tryOpenSession()
-        if not result.ok() {
-            throw RuntimeError(str(result.error))
-        }
-        go! {
-            session, ok := result.Value.(*SshSession)
-            if !ok {
-                panic("@lam/ssh internal error: openSession returned an invalid value")
-            }
-            return session
-        }
-    }
-
-    func tryDial(self, network: str, address: str) -> Result[SshTcpConn] {
+    func dial(self, network: str, address: str) -> Result[SshTcpConn] {
         if network != "tcp" and network != "tcp4" and network != "tcp6" {
             return Result.Err(Error("SshDialError", "network must be tcp, tcp4, or tcp6", None))
         }
@@ -493,7 +430,7 @@ class SshClient {
         }
     }
 
-    func tryDialTcp(self, host: str, port: int) -> Result[SshTcpConn] {
+    func dialTcp(self, host: str, port: int) -> Result[SshTcpConn] {
         if host.trim() == "" {
             return Result.Err(Error("SshDialError", "TCP host must not be empty", None))
         }
@@ -502,21 +439,7 @@ class SshClient {
         }
         go! {
             address := net.JoinHostPort(host, fmt.Sprintf("%d", port))
-            return s.TryDial("tcp", address)
-        }
-    }
-
-    func dialTcp(self, host: str, port: int) -> SshTcpConn {
-        result: Result[SshTcpConn] = self.tryDialTcp(host, port)
-        if not result.ok() {
-            throw RuntimeError(str(result.error))
-        }
-        go! {
-            connection, ok := result.Value.(*SshTcpConn)
-            if !ok {
-                panic("@lam/ssh internal error: dialTcp returned an invalid value")
-            }
-            return connection
+            return s.Dial("tcp", address)
         }
     }
 }
@@ -524,7 +447,7 @@ class SshClient {
 # Reusable command template. Each run opens a fresh native SSH session while
 # preserving environment/stdin settings. Closing it does not close the client.
 class SshSession {
-    func __init__(self, commandTimeoutMs: int = 30000) {
+    func init(self, commandTimeoutMs: int = 30000) {
         self.raw: any = None
         self.environment: dict[str, str] = {}
         self.stdinData: str = ""
@@ -574,29 +497,15 @@ class SshSession {
         }
     }
 
-    func tryRun(self, command: str) -> Result[SshCommandResult] {
+    func run(self, command: str) -> Result[SshCommandResult] {
         requestContext: Context = Context.simple()
         if self.commandTimeoutMs > 0 {
-            requestContext = requestContext.expirable(self.commandTimeoutMs, "milliseconds")
+            requestContext = requestContext.expirable(self.commandTimeoutMs, "milliseconds")?
         }
-        return self.tryRunContext(requestContext, command)
+        return self.runContext(requestContext, command)
     }
 
-    func run(self, command: str) -> SshCommandResult {
-        result: Result[SshCommandResult] = self.tryRun(command)
-        if not result.ok() {
-            throw RuntimeError(str(result.error))
-        }
-        go! {
-            commandResult, ok := result.Value.(*SshCommandResult)
-            if !ok {
-                panic("@lam/ssh internal error: command returned an invalid value")
-            }
-            return commandResult
-        }
-    }
-
-    func tryRunContext(self, requestContext: Context, command: str) -> Result[SshCommandResult] {
+    func runContext(self, requestContext: Context, command: str) -> Result[SshCommandResult] {
         go! {
             state, ok := s.Raw.(*lamSshSessionState)
             if !ok || state == nil {
@@ -617,20 +526,6 @@ class SshSession {
         }
     }
 
-    func runContext(self, requestContext: Context, command: str) -> SshCommandResult {
-        result: Result[SshCommandResult] = self.tryRunContext(requestContext, command)
-        if not result.ok() {
-            throw RuntimeError(str(result.error))
-        }
-        go! {
-            commandResult, ok := result.Value.(*SshCommandResult)
-            if !ok {
-                panic("@lam/ssh internal error: command returned an invalid value")
-            }
-            return commandResult
-        }
-    }
-
     func close(self) {
         go! {
             state, ok := s.Raw.(*lamSshSessionState)
@@ -647,11 +542,11 @@ class SshSession {
 
 # Typed net.Conn obtained through SSH direct-tcpip forwarding.
 class SshTcpConn {
-    func __init__(self) {
+    func init(self) {
         self.raw: any = None
     }
 
-    func trySend(self, data: str) -> Result[int] {
+    func send(self, data: str) -> Result[int] {
         go! {
             state, ok := s.Raw.(*lamSshTcpConnState)
             if !ok || state == nil {
@@ -672,21 +567,7 @@ class SshTcpConn {
         }
     }
 
-    func send(self, data: str) -> int {
-        result: Result[int] = self.trySend(data)
-        if not result.ok() {
-            throw RuntimeError(str(result.error))
-        }
-        go! {
-            written, ok := result.Value.(int)
-            if !ok {
-                panic("@lam/ssh internal error: send returned an invalid value")
-            }
-            return written
-        }
-    }
-
-    func tryRecv(self, maxBytes: int = 4096) -> Result[str] {
+    func receive(self, maxBytes: int = 4096) -> Result[str] {
         if maxBytes <= 0 or maxBytes > 16777216 {
             return Result.Err(Error("SshTcpReadError", "maxBytes must be between 1 and 16777216", None))
         }
@@ -708,20 +589,6 @@ class SshTcpConn {
                 return lamSshClientResultError("SshTcpReadError", "SSH TCP read failed: "+err.Error())
             }
             return LAMMERGEIER.Result.Ok(string(buffer[:n]))
-        }
-    }
-
-    func recv(self, maxBytes: int = 4096) -> str {
-        result: Result[str] = self.tryRecv(maxBytes)
-        if not result.ok() {
-            throw RuntimeError(str(result.error))
-        }
-        go! {
-            data, ok := result.Value.(string)
-            if !ok {
-                panic("@lam/ssh internal error: recv returned an invalid value")
-            }
-            return data
         }
     }
 
@@ -782,24 +649,27 @@ class SshTcpConn {
         }
     }
 
-    func close(self) {
+    func close(self) -> Result {
         go! {
             state, ok := s.Raw.(*lamSshTcpConnState)
             if !ok || state == nil {
-                return
+                return LAMMERGEIER.Result.Ok(nil)
             }
             state.Mu.Lock()
             if state.Closed || state.Conn == nil {
                 state.Closed = true
                 state.Conn = nil
                 state.Mu.Unlock()
-                return
+                return LAMMERGEIER.Result.Ok(nil)
             }
             conn := state.Conn
             state.Closed = true
             state.Conn = nil
             state.Mu.Unlock()
-            _ = conn.Close()
+            if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+                return lamSshClientResultError("SshTcpCloseError", "could not close SSH TCP connection: "+err.Error())
+            }
+            return LAMMERGEIER.Result.Ok(nil)
         }
     }
 }

@@ -2,9 +2,10 @@
 #
 # New code should import and use lamcontext.Context directly. @lam/ssh
 # re-exports Context so callers do not need a second import. SshContext is a
-# stateless convenience facade and every method returns a stdlib Context value.
+# stateless convenience facade; expirable preserves validation as Result.
 
 from lamcontext import Context
+from lamerrors import Result
 
 class SshContext {
     static func simple() -> Context {
@@ -15,7 +16,7 @@ class SshContext {
         return Context.simple().cancellable()
     }
 
-    static func expirable(expiration: int, unit: any = None) -> Context {
+    static func expirable(expiration: int, unit: any = None) -> Result[Context] {
         return Context.simple().expirable(expiration, unit)
     }
 
