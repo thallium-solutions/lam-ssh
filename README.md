@@ -34,20 +34,20 @@ Pin a tag or commit in reproducible projects rather than tracking a branch.
 lamc install @lam/ssh@^2.0.0
 ```
 
-The scoped package root exports the public API. The generated `ssh.lam` shim remains available for local flat-module development and retains its scaffolded `tag()` smoke test. Import the canonical package with:
+The scoped package root exports the public API. The `ssh.lam` shim remains available for local flat-module development. Import the canonical package with:
 
 ```lammergeier
 from @lam/ssh import SshConfig, SshClient, SshCommandResult
 ```
 
-The canonical root intentionally does not export generic `tag()`, allowing a dependent scoped package to define its own `tag` without a generated Go-symbol collision.
+Neither the canonical root nor the flat shim declares a generic `tag()` (name and version live in `lamlib.toml`), so a dependent package or application can define its own `tag` without a generated Go-symbol collision.
 
 ## Package layout and composition
 
 ```text
 lam-ssh/
 ├── __init__.lam          # canonical @lam/ssh exports; no tag()
-├── ssh.lam               # generated flat-mode compatibility shim + tag()
+├── ssh.lam               # flat-mode compatibility shim
 ├── ssh_config.lam        # uniquely named root implementation
 ├── ssh_context.lam
 ├── ssh_key.lam

@@ -2,6 +2,20 @@
 
 All notable changes to `@lam/ssh` are documented here.
 
+## [3.0.0] - 2026-10-15
+
+### Fixed
+
+- The test runner accepted only `lamc` 1.18.x, contradicting the package's `^1.18`
+  compatibility; it now accepts any 1.x release from 1.18.0 on.
+
+### Removed
+
+- **Breaking:** removed the root `tag()` helper. The package name and version
+  are declared in `lamlib.toml`, and the generic top-level function made this
+  package impossible to link together with any other package (or application)
+  that also declared `tag()`, because all Lam modules share one Go package.
+
 ## [2.0.0] - 2026-09-30
 
 ### Changed

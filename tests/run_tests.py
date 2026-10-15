@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile and run every consumer-style Lam test with lamc 1.18.x."""
+"""Compile and run every consumer-style Lam test with a ``^1.18`` lamc (>=1.18, <2)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 TESTS = pathlib.Path(__file__).resolve().parent
-REQUIRED_MAJOR_MINOR = (1, 18)
+MIN_COMPILER_VERSION = (1, 18, 0)
 VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?$")
 
 
@@ -38,10 +38,10 @@ def require_lamc() -> str:
     match = VERSION_RE.fullmatch(version)
     if match is None:
         raise SystemExit(f"error: unrecognized lamc version output: {version!r}")
-    major_minor = (int(match.group(1)), int(match.group(2)))
-    if major_minor != REQUIRED_MAJOR_MINOR:
+    parsed = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    if not (MIN_COMPILER_VERSION <= parsed < (2, 0, 0)):
         raise SystemExit(
-            f"error: @lam/ssh tests require lamc 1.18.x; found {version}"
+            f"error: @lam/ssh tests require lamc ^1.18 (>=1.18.0,<2.0.0); found {version}"
         )
     return lamc
 
