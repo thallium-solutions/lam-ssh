@@ -23,7 +23,7 @@ Use `lamc install` when testing the canonical scoped `from @lam/ssh import ...` 
 ### Git
 
 ```bash
-lamc install https://github.com/thallium-solutions/lam-ssh.git@v2.0.0
+lamc install https://github.com/thallium-solutions/lam-ssh.git@3.0.0
 ```
 
 Pin a tag or commit in reproducible projects rather than tracking a branch.
