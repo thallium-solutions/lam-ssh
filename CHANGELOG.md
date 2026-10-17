@@ -2,6 +2,15 @@
 
 All notable changes to `@lam/ssh` are documented here.
 
+## [3.0.1] - 2026-10-22
+
+### Security
+
+- `golang.org/x/crypto` v0.55.0 → v0.58.0: fixes GO-2026-6354 and
+  GO-2026-6355 (denial of service through deadlocked established/undecided
+  SSH channels). Requires Go 1.26 (the Go toolchain is fetched
+  automatically with `GOTOOLCHAIN=auto`).
+
 ## [3.0.0] - 2026-10-15
 
 ### Fixed
