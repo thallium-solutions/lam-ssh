@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile and run every consumer-style Lam test with a ``>=1.18, <3`` lamc."""
+"""Compile and run every consumer-style Lam test with a ``>=1.18, <4`` lamc."""
 
 from __future__ import annotations
 
@@ -39,9 +39,9 @@ def require_lamc() -> str:
     if match is None:
         raise SystemExit(f"error: unrecognized lamc version output: {version!r}")
     parsed = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
-    if not (MIN_COMPILER_VERSION <= parsed < (3, 0, 0)):
+    if not (MIN_COMPILER_VERSION <= parsed < (4, 0, 0)):
         raise SystemExit(
-            f"error: @lam/ssh tests require lamc >=1.18, <3; found {version}"
+            f"error: @lam/ssh tests require lamc >=1.18, <4; found {version}"
         )
     return lamc
 

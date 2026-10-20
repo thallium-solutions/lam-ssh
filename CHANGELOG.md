@@ -2,6 +2,12 @@
 
 All notable changes to `@lam/ssh` are documented here.
 
+## [3.0.3] - 2026-10-20
+
+### Changed
+
+- Compatible with `lamc` 3.x: `compatibility.lamc = ">=1.18, <4"` (test runner too).
+
 ## [3.0.2] - 2026-10-18
 
 ### Changed
