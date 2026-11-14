@@ -2,6 +2,23 @@
 
 All notable changes to `@lam/ssh` are documented here.
 
+## [3.0.5] - 2026-11-14
+
+### Tests
+
+- `tests/test_loopback_concurrency_edges.lam`: 24 concurrent commands on one
+  client and 6 concurrent clients from async tasks; every byte value through
+  stdin/stdout, non-ASCII output, 1 MiB of output and of input, exit 255 with
+  a large stderr; config and session command timeouts (and a negative
+  timeout); session environments, `clearEnv`, `withEnvironment` with
+  non-ASCII values; an encrypted private key file, a wrong passphrase and an
+  unknown key; dials to closed ports and non-TCP networks, empty commands, a
+  server going away under a connected client and refused connections; a
+  `RemoteShell` class composing `?`, `do/catch` and comprehensions.
+- The loopback fixture rejects a `direct-tcpip` channel whose target refuses
+  the connection (`ConnectionFailed`, as sshd does) instead of accepting and
+  closing it.
+
 ## [3.0.4] - 2026-11-03
 
 ### Changed

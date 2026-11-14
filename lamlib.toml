@@ -1,6 +1,6 @@
 [library]
 name        = "@lam/ssh"
-version     = "3.0.4"
+version     = "3.0.5"
 description = "Production-minded SSH client, sessions, keys, and direct TCP dialing for Lammergeier"
 license     = "Apache-2.0"
 authors     = ["Thallium Solutions"]

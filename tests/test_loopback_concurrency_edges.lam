@@ -1,0 +1,224 @@
+# Loopback edge cases and concurrency through the public @lam/ssh API:
+# concurrent commands on one client (SSH channels are multiplexed) and
+# concurrent clients from async tasks; byte-exact binary stdin, non-ASCII
+# output, 1 MiB of output and of input; command timeouts from the config
+# and from a session; exit codes; environment dictionaries and clearEnv;
+# private keys from files, encrypted keys and the wrong key; refused
+# connections, dials to closed ports, empty commands; a server that goes
+# away under a connected client. A `RemoteShell` class composes them with
+# `?` and `do/catch`.
+
+from lamerrors import Result, Error
+from lamos import Os
+from lamtest import Test
+from lamtime import Time
+from @lam/ssh import SshConfig, SshKeyPair, SshClient, SshSession, SshCommandResult
+from loopback_server import LoopbackSshServer
+
+go! {
+    func sshAllBytes() string {
+        raw := make([]byte, 256)
+        for i := range raw {
+            raw[i] = byte(i)
+        }
+        return string(raw)
+    }
+}
+
+func passwordConfig(server: LoopbackSshServer) -> SshConfig {
+    config: SshConfig = SshConfig("127.0.0.1", "tester", server.port)
+    config.withPassword("loopback-secret").withHostKeyFingerprint(server.fingerprint)
+    config.withTimeouts(2000, 2000, 10000)
+    return config
+}
+
+func kind(r: Result) -> str {
+    if r.ok() {
+        return "ok"
+    }
+    return r.error.kind
+}
+
+#- A tiny remote-execution helper as an application would write it. -#
+class RemoteShell {
+    func init(self, client: SshClient) {
+        self.client: SshClient = client
+    }
+
+    func output(self, command: str) -> Result[str] {
+        result: SshCommandResult = self.client.run(command)?
+        if not result.success {
+            return Result.Err(Error("RemoteCommandFailed", f"{command}: exit {result.exitCode}: {result.stderr}"))
+        }
+        return Result.Ok(result.stdout)
+    }
+
+    func lines(self, command: str) -> Result[list[str]] {
+        text: str = self.output(command)?
+        return Result.Ok([line for line in text.split("\n") if line != ""])
+    }
+}
+
+async func runTask(shell: RemoteShell, i: int) -> Result[str] {
+    return shell.output(f"printf 'task-%s' {i}")
+}
+
+async func clientTask(server: LoopbackSshServer, i: int) -> Result[str] {
+    client: SshClient = SshClient.connect(passwordConfig(server))?
+    out: SshCommandResult = client.run(f"printf 'client-{i}'")?
+    _ = client.close()?
+    return Result.Ok(out.stdout)
+}
+
+func checkConcurrency(server: LoopbackSshServer) -> Result {
+    client: SshClient = SshClient.connect(passwordConfig(server))?
+    shell: RemoteShell = RemoteShell(client)
+    pending = [runTask(shell, i) for i in range(24)]
+    outputs: list[str] = []
+    for task in pending {
+        r: Result[str] = await task
+        outputs.append(r.unwrapOr("error"))
+    }
+    _ = Test.assertEqual(outputs, [f"task-{i}" for i in range(24)], "24 concurrent commands on one client keep their outputs")
+
+    clients = [clientTask(server, i) for i in range(6)]
+    seen: list[str] = []
+    for task in clients {
+        r: Result[str] = await task
+        seen.append(r.unwrapOr("error"))
+    }
+    _ = Test.assertEqual(seen, [f"client-{i}" for i in range(6)], "6 concurrent clients connect and run")
+
+    files: list[str] = shell.lines("printf 'b\\na\\n\\nc\\n'")?
+    _ = Test.assertEqual(files, ["b", "a", "c"], "RemoteShell.lines drops empty lines")
+    outcome: str = ""
+    do {
+        _ = shell.output("printf oops >&2; exit 3")?
+        outcome = "accepted"
+    } catch err {
+        outcome = f"{err.kind}: {err.message}"
+    }
+    _ = Test.assertEqual(outcome, "RemoteCommandFailed: printf oops >&2; exit 3: exit 3: oops", "failed commands propagate through ? into do/catch")
+    _ = client.close()?
+    return Result.Ok(None)
+}
+
+func checkData(server: LoopbackSshServer) -> Result {
+    client: SshClient = SshClient.connect(passwordConfig(server))?
+    raw: str = ""
+    go! {
+        raw = sshAllBytes()
+    }
+    session: SshSession = client.openSession()?
+    echoed: SshCommandResult = session.stdin(raw).run("cat")?
+    _ = Test.assertTrue(echoed.stdout == raw and len(bytes(echoed.stdout)) == 256, "every byte value round-trips through stdin and stdout")
+
+    text: SshCommandResult = client.run("printf 'Grüße 🦅 東京'")?
+    _ = Test.assertEqual(text.stdout, "Grüße 🦅 東京", "non-ASCII output")
+    _ = Test.assertEqual(len(bytes(text.stdout)), 19, "non-ASCII output byte size")
+
+    big: SshCommandResult = client.run("head -c 1048576 /dev/zero | tr '\\0' x")?
+    _ = Test.assertEqual(len(big.stdout), 1048576, "1 MiB of output")
+    counted: SshCommandResult = session.stdin("λ" * 524288).run("wc -c")?
+    _ = Test.assertEqual(counted.stdout.trim(), "1048576", "1 MiB of non-ASCII input arrives as bytes")
+
+    noisy: SshCommandResult = client.run("head -c 200000 /dev/zero | tr '\\0' e >&2; exit 255")?
+    _ = Test.assertTrue(noisy.exitCode == 255 and len(noisy.stderr) == 200000 and not noisy.success, "exit 255 and a large stderr")
+
+    session.clearStdin().env("LAM_SSH_A", "first")
+    _ = Test.assertEqual(session.run("printf %s \"$LAM_SSH_A\"")?.stdout, "first", "session environment")
+    session.clearEnv()
+    _ = Test.assertEqual(session.run("printf '[%s]' \"$LAM_SSH_A\"")?.stdout, "[]", "clearEnv removes the session environment")
+
+    environment: SshConfig = passwordConfig(server).withEnvironment({"LAM_SSH_X": "x-value", "LAM_SSH_Y": "Zoë 🦅"})
+    withEnv: SshClient = SshClient.connect(environment)?
+    _ = Test.assertEqual(withEnv.run("printf '%s|%s' \"$LAM_SSH_X\" \"$LAM_SSH_Y\"")?.stdout, "x-value|Zoë 🦅", "withEnvironment reaches commands, non-ASCII values too")
+    _ = withEnv.close()?
+
+    _ = Test.assertEqual(kind(client.run("   ")), "SshCommandError", "an empty command is refused")
+    session.close()
+    _ = client.close()?
+    return Result.Ok(None)
+}
+
+func checkTimeouts(server: LoopbackSshServer) -> Result {
+    quick: SshConfig = passwordConfig(server).withCommandTimeout(200)
+    client: SshClient = SshClient.connect(quick)?
+    started: int = Time.nowUnixMilli()
+    slow: Result[SshCommandResult] = client.run("sleep 3")
+    elapsed: int = Time.nowUnixMilli() - started
+    _ = Test.assertTrue(kind(slow) == "SshContextCancelled" and elapsed < 2000, "config command timeout stops a long command")
+    _ = Test.assertTrue(client.run("printf still")?.stdout == "still", "the client is usable after a timeout")
+
+    session: SshSession = client.openSession()?
+    session.withCommandTimeout(150)
+    _ = Test.assertEqual(kind(session.run("sleep 3")), "SshContextCancelled", "session command timeout")
+    session.withCommandTimeout(0)
+    _ = Test.assertEqual(session.run("sleep 0.3; printf done")?.stdout, "done", "a session timeout of 0 waits")
+    raised: bool = false
+    try {
+        session.withCommandTimeout(-1)
+    } catch ValueError as _e {
+        raised = true
+    }
+    _ = Test.assertTrue(raised, "a negative session timeout is a ValueError")
+    _ = client.close()?
+    return Result.Ok(None)
+}
+
+func checkKeys() -> Result {
+    pair: SshKeyPair = SshKeyPair.generateEd25519("file-user", "key-passphrase")?
+    server: LoopbackSshServer = LoopbackSshServer.start("tester", "unused-password", pair.authorizedPublicKey())?
+    path: str = Os.tempFile("lam-ssh-key-", "")?
+    _ = Os.writeFile(path, pair.privateKeyPem)?
+
+    fromFile: SshConfig = SshConfig("127.0.0.1", "tester", server.port)
+    fromFile.withPrivateKeyFile(path, "key-passphrase").withHostKeyFingerprint(server.fingerprint).withTimeouts(2000, 2000, 5000)
+    client: SshClient = SshClient.connect(fromFile)?
+    _ = Test.assertEqual(client.run("printf key-file")?.stdout, "key-file", "encrypted private key file with its passphrase")
+    _ = client.close()?
+
+    wrongPassphrase: SshConfig = SshConfig("127.0.0.1", "tester", server.port)
+    wrongPassphrase.withPrivateKeyFile(path, "wrong").withHostKeyFingerprint(server.fingerprint).withTimeouts(2000, 2000, 5000)
+    _ = Test.assertFalse(SshClient.connect(wrongPassphrase).ok(), "a wrong passphrase is refused")
+
+    other: SshKeyPair = SshKeyPair.generateEd25519("intruder")?
+    wrongKey: SshConfig = SshConfig("127.0.0.1", "tester", server.port)
+    wrongKey.withPrivateKey(other.privateKeyPem).withHostKeyFingerprint(server.fingerprint).withTimeouts(2000, 2000, 5000)
+    _ = Test.assertEqual(kind(SshClient.connect(wrongKey)), "SshHandshakeError", "a key the server does not know is refused")
+    _ = Os.remove(path)?
+    server.close()
+    return Result.Ok(None)
+}
+
+func checkFailures() -> Result {
+    server: LoopbackSshServer = LoopbackSshServer.start()?
+    closedPort: int = server.port
+    client: SshClient = SshClient.connect(passwordConfig(server))?
+    _ = Test.assertEqual(kind(client.dialTcp("127.0.0.1", 1)), "SshDialError", "dialing a closed port through SSH fails")
+    _ = Test.assertEqual(kind(client.dialTcp("127.0.0.1", 70000)), "SshDialError", "an out-of-range port is refused")
+    _ = Test.assertEqual(kind(client.dial("udp", "127.0.0.1:53")), "SshDialError", "only TCP networks can be dialed")
+
+    server.close()
+    waited: int = 0
+    while client.connected() and waited < 40 {
+        Time.sleepMs(50)
+        waited++
+    }
+    _ = Test.assertFalse(client.connected(), "a client notices the server went away")
+    _ = Test.assertFalse(client.run("printf gone").ok(), "commands fail once the server is gone")
+    _ = Test.assertEqual(kind(SshClient.connect(passwordConfig(server))), "SshConnectError", "connecting to a closed port is a connect error")
+    _ = closedPort
+    return Result.Ok(None)
+}
+
+func main() {
+    server: LoopbackSshServer = LoopbackSshServer.start().unwrap()
+    _ = Test.assertTrue(checkConcurrency(server).ok(), "concurrency checks complete")
+    _ = Test.assertTrue(checkData(server).ok(), "data checks complete")
+    _ = Test.assertTrue(checkTimeouts(server).ok(), "timeout checks complete")
+    server.close()
+    _ = Test.assertTrue(checkKeys().ok(), "key checks complete")
+    _ = Test.assertTrue(checkFailures().ok(), "failure checks complete")
+    _summary: int = Test.summary()
+}

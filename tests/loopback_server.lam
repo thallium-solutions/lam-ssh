@@ -145,9 +145,9 @@ go! {
         commandMu.Unlock()
     }
 
-    func lamLoopbackForward(channel gossh.Channel, requests <-chan *gossh.Request, payload []byte) {
-        defer channel.Close()
-        go gossh.DiscardRequests(requests)
+    // lamLoopbackDialForward connects to the direct-tcpip target first, so a
+    // refused target rejects the channel (ConnectionFailed) as sshd does.
+    func lamLoopbackDialForward(payload []byte) (net.Conn, error) {
         var direct struct {
             DestAddr   string
             DestPort   uint32
@@ -155,18 +155,19 @@ go! {
             OriginPort uint32
         }
         if err := gossh.Unmarshal(payload, &direct); err != nil {
-            return
+            return nil, err
         }
         if direct.DestAddr != "127.0.0.1" && direct.DestAddr != "localhost" && direct.DestAddr != "::1" {
-            return
+            return nil, errors.New("only loopback targets are forwarded")
         }
         target := net.JoinHostPort(direct.DestAddr, strconv.Itoa(int(direct.DestPort)))
-        conn, err := net.DialTimeout("tcp", target, time.Second)
-        if err != nil {
-            return
-        }
-        defer conn.Close()
+        return net.DialTimeout("tcp", target, time.Second)
+    }
 
+    func lamLoopbackForward(channel gossh.Channel, requests <-chan *gossh.Request, conn net.Conn) {
+        defer channel.Close()
+        defer conn.Close()
+        go gossh.DiscardRequests(requests)
         done := make(chan struct{}, 2)
         go func() { _, _ = io.Copy(conn, channel); done <- struct{}{} }()
         go func() { _, _ = io.Copy(channel, conn); done <- struct{}{} }()
@@ -184,11 +185,17 @@ go! {
                 go lamLoopbackSession(channel, requests)
             case "direct-tcpip":
                 payload := append([]byte(nil), newChannel.ExtraData()...)
-                channel, requests, err := newChannel.Accept()
+                conn, err := lamLoopbackDialForward(payload)
                 if err != nil {
+                    _ = newChannel.Reject(gossh.ConnectionFailed, err.Error())
                     continue
                 }
-                go lamLoopbackForward(channel, requests, payload)
+                channel, requests, err := newChannel.Accept()
+                if err != nil {
+                    conn.Close()
+                    continue
+                }
+                go lamLoopbackForward(channel, requests, conn)
             default:
                 _ = newChannel.Reject(gossh.UnknownChannelType, "unsupported channel")
             }
